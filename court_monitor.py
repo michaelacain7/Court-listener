@@ -1,28 +1,30 @@
 """
 Court Filing Monitor for Public Companies
 ==========================================
-Two monitors in one:
+Monitors:
   1. Federal court filings involving public companies (all federal courts)
   2. Supreme Court opinions/orders mentioning public companies
+  3. SEC EDGAR 6-K filings for Chinese/international court rulings
+  4. Financial news for Chinese court rulings affecting US-traded stocks
 
 Alerts via Discord webhooks with DeepSeek AI summaries.
 Runs 9 AM - 4 PM EST on market open days only.
 
 RATE LIMITS:
   CourtListener: 5,000 req/hour (authenticated)
-  At 10s intervals with staggered checks: ~360 req/hr core + follow-ups = ~600/hr (very safe)
-  
+  Adaptive polling: 3s during peak, 5s normal, circuit breaker at 80% usage
+
 Deploy on Railway.
 """
 
 import os
-import gc
 import json
 import time
 import hashlib
 import logging
 import re
 import threading
+from collections import deque
 from datetime import datetime, timedelta
 from typing import Optional
 import requests
@@ -51,45 +53,94 @@ CL_BASE = "https://www.courtlistener.com"
 CL_SEARCH_URL = f"{CL_BASE}/api/rest/v4/search/"
 CL_DOCKET_URL = f"{CL_BASE}/api/rest/v4/dockets/"
 
-# 10 seconds = fastest safe interval (staggered across 6 check types = each type runs every 60s)
+# Base interval — adaptive polling adjusts this dynamically
 CHECK_INTERVAL = int(os.getenv("CHECK_INTERVAL", "5"))
 EST = pytz.timezone("US/Eastern")
 
-# Rate limit tracker
+# ── Adaptive Rate Limiter with Circuit Breaker ──
+
 class RateLimiter:
+    """Thread-safe rate limiter with circuit breaker and adaptive backoff.
+    Uses a deque for O(1) append/popleft instead of list filtering."""
+
     def __init__(self, max_per_hour=4500):
         self.max_per_hour = max_per_hour
-        self.requests = []
+        self.requests = deque()
         self.lock = threading.Lock()
-    
+        self._circuit_open = False
+        self._circuit_open_until = 0
+        self._consecutive_429s = 0
+
+    def _prune(self):
+        """Remove requests older than 1 hour. Must hold self.lock."""
+        cutoff = time.time() - 3600
+        while self.requests and self.requests[0] < cutoff:
+            self.requests.popleft()
+
     def can_request(self):
         with self.lock:
-            now = time.time()
-            self.requests = [t for t in self.requests if now - t < 3600]
+            if self._circuit_open and time.time() < self._circuit_open_until:
+                return False
+            if self._circuit_open and time.time() >= self._circuit_open_until:
+                self._circuit_open = False
+            self._prune()
             return len(self.requests) < self.max_per_hour
-    
+
     def record(self):
         with self.lock:
             self.requests.append(time.time())
-    
+
     def remaining(self):
         with self.lock:
-            now = time.time()
-            self.requests = [t for t in self.requests if now - t < 3600]
+            self._prune()
             return self.max_per_hour - len(self.requests)
-    
+
     def per_minute(self):
         with self.lock:
-            now = time.time()
-            return len([t for t in self.requests if now - t < 60])
+            cutoff = time.time() - 60
+            return sum(1 for t in self.requests if t > cutoff)
+
+    def usage_pct(self):
+        """Return current usage as a percentage of max_per_hour."""
+        with self.lock:
+            self._prune()
+            return len(self.requests) / self.max_per_hour * 100
+
+    def record_429(self):
+        """Record a 429 response — triggers circuit breaker after repeated hits."""
+        with self.lock:
+            self._consecutive_429s += 1
+            if self._consecutive_429s >= 2:
+                # Open circuit for exponential backoff: 60s, 120s, 240s...
+                wait = min(60 * (2 ** (self._consecutive_429s - 2)), 600)
+                self._circuit_open = True
+                self._circuit_open_until = time.time() + wait
+                logging.getLogger("CourtMonitor").warning(
+                    f"Circuit breaker OPEN for {wait}s after {self._consecutive_429s} consecutive 429s")
+
+    def record_success(self):
+        """Record a successful request — resets 429 counter."""
+        with self.lock:
+            self._consecutive_429s = 0
+
+    def should_throttle(self):
+        """Returns True if usage is above 80% — caller should slow down."""
+        return self.usage_pct() >= 80
 
 rate_limiter = RateLimiter()
 
+# ── Market Holidays ──
+# US stock market holidays (NYSE/NASDAQ) for 2025-2027
 MARKET_HOLIDAYS = {
-    "2025-01-01","2025-01-20","2025-02-17","2025-04-18","2025-05-26","2025-06-19",
-    "2025-07-04","2025-09-01","2025-11-27","2025-12-25",
-    "2026-01-01","2026-01-19","2026-02-16","2026-04-03","2026-05-25","2026-06-19",
-    "2026-07-03","2026-09-07","2026-11-26","2026-12-25",
+    # 2025
+    "2025-01-01", "2025-01-20", "2025-02-17", "2025-04-18", "2025-05-26", "2025-06-19",
+    "2025-07-04", "2025-09-01", "2025-11-27", "2025-12-25",
+    # 2026
+    "2026-01-01", "2026-01-19", "2026-02-16", "2026-04-03", "2026-05-25", "2026-06-19",
+    "2026-07-03", "2026-09-07", "2026-11-26", "2026-12-25",
+    # 2027
+    "2027-01-01", "2027-01-18", "2027-02-15", "2027-03-26", "2027-05-31", "2027-06-18",
+    "2027-07-05", "2027-09-06", "2027-11-25", "2027-12-24",
 }
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s", datefmt="%Y-%m-%d %H:%M:%S")
@@ -172,6 +223,8 @@ ALIAS_COMPANIES = {
     "DraftKings":"DKNG","FanDuel":"FLUT","Flutter":"FLUT",
     "Sable Offshore":"SOL","Sable":"SOL","Pacific Pipeline":"SOL",
     "Databricks":"🔥PRIVATE","ByteDance":"🔥PRIVATE","TikTok":"🔥PRIVATE",
+    # Chinese litigation watchlist companies (public tickers)
+    "Xiao-I":"AIXI","Xiao-I Corporation":"AIXI","XiaoI":"AIXI",
 }
 
 # Buzzy private companies that move markets despite not being publicly traded
@@ -205,9 +258,44 @@ BUZZY_COMPANIES = {
     "CFTC": "🏛️GOV", "SEC": "🏛️GOV", "FTC": "🏛️GOV", "DOJ": "🏛️GOV",
 }
 
+# ── Chinese Litigation Watchlist ──
+# Cases in Chinese courts affecting US-traded stocks.
+# Used by SEC EDGAR 6-K monitor and news monitor.
+CHINA_LITIGATION_WATCHLIST = {
+    "AIXI": {
+        "company": "Xiao-I Corporation",
+        "ticker": "AIXI",
+        "opponent": "Apple Inc.",
+        "opponent_ticker": "AAPL",
+        "court": "Shanghai High People's Court",
+        "case_type": "Patent infringement",
+        "status": "Damages phase — patents declared permanently valid by Supreme People's Court (Mar 2026)",
+        "damages_claimed": "$1.4 billion",
+        "keywords": ["xiao-i", "xiaoai", "AIXI", "shanghai court", "shanghai high people"],
+        "sec_cik": "0001866757",  # Xiao-I CIK for EDGAR searches
+    },
+}
+
+# SEC EDGAR 6-K search — companies to monitor for Chinese/international court filings
+EDGAR_6K_WATCHLIST = {
+    "AIXI": {
+        "cik": "0001866757",
+        "search_terms": ["xiao-i", "court", "litigation", "patent", "infringement", "damages", "ruling"],
+    },
+}
+
+# News keywords for Chinese court monitoring
+CHINA_NEWS_KEYWORDS = [
+    '"Shanghai court" Apple',
+    '"Xiao-I" court ruling',
+    '"AIXI" court',
+    '"Supreme People\'s Court" Apple patent',
+    '"Shanghai High People\'s Court"',
+    '"China court ruling" stock',
+]
+
 # ── Macro-Market Keywords ──
 # Court rulings on these topics move entire sectors even when no specific company is named.
-# "V.O.S. Selections v. Trump" (tariff refunds) is a classic example.
 MACRO_KEYWORDS = {
     # Trade / Tariffs (CAFC, Court of International Trade)
     "tariff": "📊 TARIFFS/TRADE", "tariffs": "📊 TARIFFS/TRADE",
@@ -294,18 +382,24 @@ def load_sec_companies():
     """Download ALL SEC-registered companies. Returns dict of {name: ticker}."""
     companies = {}
 
+    # Determine cache path — prefer persistent volume
+    cache_path = SEC_TICKERS_CACHE
+    vol = os.environ.get("RAILWAY_VOLUME_MOUNT_PATH") or os.environ.get("VOLUME_PATH", "")
+    if vol and os.path.isdir(vol):
+        cache_path = os.path.join(vol, "sec_tickers_cache.json")
+
     # Try cached file first (avoid hammering SEC on restarts)
     try:
-        with open(SEC_TICKERS_CACHE) as f:
+        with open(cache_path) as f:
             cached = json.load(f)
             age = time.time() - cached.get("_ts", 0)
             if age < 86400:  # Cache valid for 24 hours
-                companies = {k:v for k,v in cached.items() if k != "_ts"}
+                companies = {k: v for k, v in cached.items() if k != "_ts"}
                 if len(companies) > 5000:
                     log.info(f"Loaded {len(companies)} companies from cache")
                     return companies
-    except:
-        pass
+    except (OSError, json.JSONDecodeError, KeyError) as e:
+        log.debug(f"SEC cache load failed: {e}")
 
     # Download fresh from SEC
     log.info("Downloading SEC company tickers...")
@@ -342,8 +436,11 @@ def load_sec_companies():
         # Cache to disk
         cache_data = dict(companies)
         cache_data["_ts"] = time.time()
-        with open(SEC_TICKERS_CACHE, "w") as f:
-            json.dump(cache_data, f)
+        try:
+            with open(cache_path, "w") as f:
+                json.dump(cache_data, f)
+        except OSError as e:
+            log.warning(f"Failed to write SEC cache: {e}")
 
         log.info(f"Loaded {len(companies)} companies from SEC ({len(seen_tickers)} unique tickers)")
 
@@ -383,7 +480,8 @@ def _get_seen_path():
                 with open(test_file, "w") as f: f.write("test")
                 os.remove(test_file)
                 return os.path.join(path, "seen_filings.json")
-            except: continue
+            except OSError:
+                continue
     # Fallback to local (won't persist across deploys)
     return "seen_filings.json"
 
@@ -394,14 +492,20 @@ def load_seen():
         with open(SEEN_FILE) as f:
             data = json.load(f)
             cutoff = (datetime.now(tz=pytz.utc) - timedelta(days=7)).isoformat()
-            return {k:v for k,v in data.items() if v > cutoff}
-    except:
+            return {k: v for k, v in data.items() if v > cutoff}
+    except (OSError, json.JSONDecodeError) as e:
+        log.debug(f"Seen file load: {e}")
         return {}
 
 def save_seen(seen):
     cutoff = (datetime.now(tz=pytz.utc) - timedelta(days=7)).isoformat()
-    with open(SEEN_FILE, "w") as f:
-        json.dump({k:v for k,v in seen.items() if v > cutoff}, f)
+    try:
+        tmp_path = SEEN_FILE + ".tmp"
+        with open(tmp_path, "w") as f:
+            json.dump({k: v for k, v in seen.items() if v > cutoff}, f)
+        os.replace(tmp_path, SEEN_FILE)
+    except OSError as e:
+        log.error(f"Failed to save seen file: {e}")
 
 def mark_seen(seen, fid):
     seen[fid] = datetime.now(tz=pytz.utc).isoformat()
@@ -412,6 +516,25 @@ def is_market_hours():
     if now.strftime("%Y-%m-%d") in MARKET_HOLIDAYS: return False
     if now.hour < 9 or now.hour >= 16: return False
     return True
+
+def get_adaptive_interval():
+    """Return polling interval based on time of day and rate limit usage.
+    Faster during market open/close (high-activity windows), slower if approaching limits."""
+    if rate_limiter.should_throttle():
+        log.warning(f"Rate limit at {rate_limiter.usage_pct():.0f}% — throttling to 15s")
+        return 15
+
+    now = datetime.now(EST)
+    hour, minute = now.hour, now.minute
+
+    # Peak periods: market open (9:30-10:00) and close (3:30-4:00)
+    if (hour == 9 and minute >= 30) or (hour == 10 and minute < 0):
+        return max(3, CHECK_INTERVAL - 2)
+    if (hour == 15 and minute >= 30) or hour == 16:
+        return max(3, CHECK_INTERVAL - 2)
+
+    # Normal market hours
+    return CHECK_INTERVAL
 
 def get_cl_headers():
     h = {"Accept": "application/json"}
@@ -430,20 +553,29 @@ def cl_request(url, params=None, timeout=20):
         try:
             resp = requests.get(url, params=params, headers=get_cl_headers(), timeout=timeout)
             if resp.status_code == 429:
-                retry = int(resp.headers.get("Retry-After", 60))
-                log.warning(f"CL 429 - waiting {retry}s (attempt {attempt+1})")
-                time.sleep(min(retry, 120))
+                rate_limiter.record_429()
+                # Exponential backoff: use Retry-After header or 60 * 2^attempt
+                retry_after = 60
+                try:
+                    retry_after = int(resp.headers.get("Retry-After", 60))
+                except (ValueError, TypeError):
+                    pass
+                wait = min(retry_after * (2 ** attempt), 300)
+                log.warning(f"CL 429 - exponential backoff {wait}s (attempt {attempt+1})")
+                time.sleep(wait)
                 continue
             if resp.status_code == 401:
                 log.error("CL auth failed. Set COURTLISTENER_API_TOKEN!")
                 return None
             resp.raise_for_status()
+            rate_limiter.record_success()
             return resp.json()
         except requests.exceptions.Timeout:
-            time.sleep(5)
+            log.warning(f"CL timeout (attempt {attempt+1})")
+            time.sleep(5 * (attempt + 1))
         except requests.exceptions.RequestException as e:
             log.error(f"CL request failed: {e}")
-            time.sleep(5)
+            time.sleep(5 * (attempt + 1))
     return None
 
 def match_public_company(case_name):
@@ -521,6 +653,8 @@ def check_materiality(case_name, court="", snippet="", filing_type="new lawsuit"
     # Pattern: "SingleName v. BigCompany" = almost always individual plaintiff
     # Split on " v. " or " v " or " vs. " or " vs "
     parts = re.split(r'\s+v\.?\s+', cn, maxsplit=1, flags=re.IGNORECASE)
+    is_class = False  # Initialize before use in Layer 2
+
     if len(parts) == 2:
         plaintiff = parts[0].strip()
         defendant = parts[1].strip()
@@ -578,7 +712,6 @@ def check_materiality(case_name, court="", snippet="", filing_type="new lawsuit"
                 log.debug(f"  Docket details: NOS={nature_of_suit}, cause={cause}")
 
                 # Fast reject based on nature-of-suit codes (individual matters)
-                # NOS codes: https://www.uscourts.gov/sites/default/files/js_044_1.pdf
                 nos_lower = nature_of_suit.lower()
                 immaterial_nos = [
                     "motor vehicle", "personal injury", "product liability",
@@ -596,7 +729,7 @@ def check_materiality(case_name, court="", snippet="", filing_type="new lawsuit"
             log.debug(f"  Docket detail fetch failed: {e}")
 
     # ── Layer 3: DeepSeek classification with enriched context ──
-    DEEPSEEK_KEY = os.environ.get("DEEPSEEK_API_KEY","")
+    DEEPSEEK_KEY = os.environ.get("DEEPSEEK_API_KEY", DEEPSEEK_API_KEY)
     if not DEEPSEEK_KEY:
         return True, "No AI key - defaulting to alert"
     try:
@@ -606,7 +739,7 @@ def check_materiality(case_name, court="", snippet="", filing_type="new lawsuit"
         if snippet:
             context_block += f"\nSnippet: {snippet[:500]}"
 
-        resp = requests.post("https://api.deepseek.com/v1/chat/completions", headers={
+        resp = requests.post(DEEPSEEK_API_URL, headers={
             "Authorization": f"Bearer {DEEPSEEK_KEY}", "Content-Type": "application/json"
         }, json={
             "model": "deepseek-chat",
@@ -665,12 +798,17 @@ def send_discord(webhook_url, embeds):
         try:
             resp = requests.post(webhook_url, json={"embeds": embeds}, timeout=15)
             if resp.status_code == 429:
-                wait = resp.json().get("retry_after", 5) + 0.5
+                # Safely parse retry_after — may not be valid JSON
+                wait = 5.0
+                try:
+                    wait = float(resp.json().get("retry_after", 5)) + 0.5
+                except (ValueError, json.JSONDecodeError, AttributeError):
+                    wait = 5.0 * (attempt + 1)
                 log.warning(f"Discord 429 rate limited, waiting {wait:.1f}s")
                 time.sleep(wait)
                 continue
             if resp.status_code in (200, 204):
-                # Mirror to the combined webhook (fire-and-forget)
+                # Mirror to the combined webhook (fire-and-forget with timeout)
                 if DISCORD_WEBHOOK_MIRROR and webhook_url != DISCORD_WEBHOOK_MIRROR:
                     try:
                         requests.post(DISCORD_WEBHOOK_MIRROR, json={"embeds": embeds}, timeout=10)
@@ -682,7 +820,7 @@ def send_discord(webhook_url, embeds):
                 return False
         except Exception as e:
             log.error(f"Discord send error (attempt {attempt+1}): {e}")
-            time.sleep(2)
+            time.sleep(2 * (attempt + 1))
     log.error(f"Discord send failed after 3 attempts")
     return False
 
@@ -703,8 +841,7 @@ def format_tickers(matches):
     return " | ".join(parts) if parts else ""
 
 def get_filing_url(item, search_type="o"):
-    """Build the best available URL for a CL search result.
-    Tries absolute_url first, then constructs from IDs, then falls back to Google search."""
+    """Build the best available URL for a CL search result."""
     # 1. Direct absolute_url from CL
     if item.get("absolute_url"):
         url = item["absolute_url"]
@@ -769,6 +906,8 @@ def extract_pdf_text(pdf_url, max_pages=10, max_chars=12000):
         if len(text) > 100:
             log.debug(f"PDF extracted via pdfplumber: {len(text)} chars")
             return text[:max_chars]
+    except ImportError:
+        log.debug("pdfplumber not installed, skipping")
     except Exception as e:
         log.debug(f"pdfplumber extraction failed: {e}")
 
@@ -808,8 +947,6 @@ def fetch_cl_opinion_text(item):
                 text = re.sub(r'<[^>]+>','',od["html"])
                 log.info(f"  Fetched opinion HTML: {len(text)} chars")
                 return text[:12000]
-            # If opinion has a download URL (PDF), note it but don't download
-            # (CL PDFs require PACER access usually)
 
     # Method 2: Fetch the cluster for syllabus/summary
     cid = item.get("cluster_id","")
@@ -1098,6 +1235,8 @@ def check_new_dockets(seen, idx):
         "Binance","Ripple","Kraken","Tether",
         "Anduril","CoreWeave","Cerebras","Perplexity",
         "Epic Games","Discord","Figma",
+        # Chinese litigation watchlist
+        "Xiao-I",
     ]
 
     co = DOCKET_WATCH_NAMES[idx % len(DOCKET_WATCH_NAMES)]
@@ -1260,8 +1399,7 @@ def check_scotus_website(seen):
         from html.parser import HTMLParser
 
         # Also extract PDF links from the page
-        import re as _re
-        pdf_links = _re.findall(r'href="(/opinions/\d+pdf/[^"]+\.pdf)"', resp.text, _re.IGNORECASE)
+        pdf_links = re.findall(r'href="(/opinions/\d+pdf/[^"]+\.pdf)"', resp.text, re.IGNORECASE)
 
         class P(HTMLParser):
             def __init__(self):
@@ -1352,7 +1490,6 @@ def check_scotus_website(seen):
 def check_cafc_website(seen):
     """Scrape CAFC opinions table for new filings involving public companies."""
     alerts = 0
-    # The opinions TABLE page has direct PDF links; the blog page only has HTML post links
     CAFC_URL = "https://www.cafc.uscourts.gov/home/case-information/opinions-orders/"
     CAFC_BASE = "https://www.cafc.uscourts.gov"
     try:
@@ -1362,12 +1499,9 @@ def check_cafc_website(seen):
             log.warning(f"CAFC table page returned {resp.status_code}")
             return 0
 
-        import re as _re
-
         # PDF links from the opinions table (primary source)
-        # Match: <a href="/opinions-orders/24-1346.OPINION.2-19-2026_2649652.pdf">CASE NAME [TYPE]</a>
-        pdf_pattern = _re.compile(
-            r'<a\s+href="(/opinions-orders/[^"]+\.pdf)"[^>]*>\s*([^<]+?)\s*</a>', _re.IGNORECASE)
+        pdf_pattern = re.compile(
+            r'<a\s+href="(/opinions-orders/[^"]+\.pdf)"[^>]*>\s*([^<]+?)\s*</a>', re.IGNORECASE)
 
         entries = []
         seen_case_nums = set()
@@ -1376,7 +1510,7 @@ def check_cafc_website(seen):
             path, title = match.group(1), match.group(2).strip()
             pdf_url = f"{CAFC_BASE}{path}"
             if title and len(title) > 5:
-                cn_match = _re.search(r'(\d{2}-\d{3,5})', path)
+                cn_match = re.search(r'(\d{2}-\d{3,5})', path)
                 case_num = cn_match.group(1) if cn_match else None
                 if case_num and case_num not in seen_case_nums:
                     seen_case_nums.add(case_num)
@@ -1393,15 +1527,15 @@ def check_cafc_website(seen):
                 blog_resp = requests.get("https://www.cafc.uscourts.gov/category/opinion-order/",
                     timeout=15, headers={"User-Agent": "CourtFilingMonitor/1.0"})
                 if blog_resp.ok:
-                    post_pattern = _re.compile(
+                    post_pattern = re.compile(
                         r'<a\s+href="(https?://www\.cafc\.uscourts\.gov/\d{2}-\d{2}-\d{4}[^"]*)"[^>]*>\s*'
-                        r'([^<]+?)\s*</a>', _re.IGNORECASE)
+                        r'([^<]+?)\s*</a>', re.IGNORECASE)
                     for match in post_pattern.finditer(blog_resp.text):
                         url, title = match.group(1), match.group(2).strip()
                         if title and len(title) > 5:
                             entries.append((url, title, None))
-            except:
-                pass
+            except Exception as e:
+                log.debug(f"CAFC blog page fetch failed: {e}")
 
         if not entries:
             return 0
@@ -1413,7 +1547,7 @@ def check_cafc_website(seen):
             mark_seen(seen, fid)
 
             # Extract case name (strip [OPINION], [ORDER], [RULE 36 JUDGMENT] suffix)
-            case_name = _re.sub(r'\s*\[(OPINION|ORDER|RULE\s*36\s*JUDGMENT|ERRATA)\].*$', '', title, flags=_re.IGNORECASE).strip()
+            case_name = re.sub(r'\s*\[(OPINION|ORDER|RULE\s*36\s*JUDGMENT|ERRATA)\].*$', '', title, flags=re.IGNORECASE).strip()
 
             # Determine doc type for display
             doc_type = "Opinion"
@@ -1460,9 +1594,9 @@ def check_cafc_website(seen):
                     page_resp = requests.get(url, timeout=15,
                         headers={"User-Agent": "CourtFilingMonitor/1.0"})
                     if page_resp.ok:
-                        pdf_match = _re.search(
+                        pdf_match = re.search(
                             r'href="((?:https?://www\.cafc\.uscourts\.gov)?/opinions-orders/[^"]+\.pdf)"',
-                            page_resp.text, _re.IGNORECASE)
+                            page_resp.text, re.IGNORECASE)
                         if pdf_match:
                             found = pdf_match.group(1)
                             pdf_url = found if found.startswith('http') else f"{CAFC_BASE}{found}"
@@ -1493,13 +1627,12 @@ def check_cafc_website(seen):
             if matches:
                 tstr = format_tickers(matches)
             else:
-                # Macro match — show sector tags
                 tstr = " | ".join(sector for _, sector in macro_matches[:3])
 
             embed = {
                 "title": f"{'🔴' if is_macro else '🚨'} CAFC {doc_type}: {case_name[:200]}",
                 "url": url,
-                "color": 0xFF0000 if is_macro else 0xFF0000,
+                "color": 0xFF0000,
                 "fields": [
                     {"name": "📊 Impact" if is_macro else "📊 Tickers", "value": tstr, "inline": False},
                     {"name": "🏛️ Court", "value": "U.S. Court of Appeals for the Federal Circuit", "inline": False},
@@ -1518,14 +1651,9 @@ def check_cafc_website(seen):
     return alerts
 
 # ── State Court Ruling Scrapers ──
-# These only fetch RULINGS (opinions/orders), not new filings.
-# State court opinions pages naturally filter for this.
 
 def check_delaware_courts(seen):
-    """Scrape Delaware Court of Chancery and Supreme Court opinions.
-    Delaware Chancery is THE most important state court for corporate litigation:
-    M&A disputes, shareholder suits, corporate governance, fiduciary duty cases.
-    ~300 Chancery + ~100 Supreme Court opinions per year."""
+    """Scrape Delaware Court of Chancery and Supreme Court opinions."""
     alerts = 0
     for court_slug, court_label in [("court+of+chancery", "Chancery"), ("supreme+court", "Supreme")]:
         url = f"https://courts.delaware.gov/opinions/index.aspx?ag={court_slug}"
@@ -1541,8 +1669,6 @@ def check_delaware_courts(seen):
             log.debug(f"Delaware {court_label} fetch failed: {e}")
             continue
 
-        # Parse the opinions table - rows contain: Caption, Date, File Number, Court, Type, Judge, Description
-        # Pattern: <a href="/Opinions/Download.aspx?id=XXXXX">CASE NAME</a> ... date ... description
         rows = re.findall(
             r'<a\s+href="(/Opinions/Download\.aspx\?id=\d+)"[^>]*>([^<]+)</a>.*?'
             r'(\d{2}/\d{2}/\d{4})',
@@ -1553,9 +1679,9 @@ def check_delaware_courts(seen):
         for pdf_path, case_name, date_str in rows[:20]:
             try:
                 filed = datetime.strptime(date_str, "%m/%d/%Y").date()
-                if (today - filed).days > 2:  # Only last 2 days
+                if (today - filed).days > 2:
                     continue
-            except:
+            except ValueError:
                 continue
 
             fid = f"de_{hashlib.md5((case_name + date_str).encode()).hexdigest()}"
@@ -1568,7 +1694,6 @@ def check_delaware_courts(seen):
             log.info(f"DE {court_label}: {case_name[:80]}")
             pdf_url = f"https://courts.delaware.gov{pdf_path}"
 
-            # Fetch opinion PDF text for AI summary
             opinion_text = extract_pdf_text(pdf_url)
             if opinion_text:
                 log.info(f"  DE PDF text: {len(opinion_text)} chars extracted")
@@ -1594,9 +1719,7 @@ def check_delaware_courts(seen):
     return alerts
 
 def check_california_courts(seen):
-    """Scrape California Courts of Appeal and Supreme Court published opinions.
-    courts.ca.gov/opinionsearch.htm provides recent published opinions.
-    Covers big CA company rulings (tech, energy, environmental)."""
+    """Scrape California Courts of Appeal and Supreme Court published opinions."""
     url = "https://www.courts.ca.gov/cms/opinionsearch.htm"
     try:
         resp = requests.get(url, timeout=20, headers={
@@ -1611,9 +1734,6 @@ def check_california_courts(seen):
         return 0
 
     alerts = 0
-    # CA opinions page has links to PDFs with case names
-    # Pattern varies but typically: case name, date, court, link
-    # Try to find opinion entries - the page structure uses tables or divs
     entries = re.findall(
         r'href="([^"]*\.(?:pdf|PDF|htm|aspx)[^"]*)"[^>]*>\s*([^<]{10,200})',
         html
@@ -1623,7 +1743,6 @@ def check_california_courts(seen):
     for link, case_name in entries[:30]:
         case_name = re.sub(r'<[^>]+>', '', case_name).strip()
         if not case_name or len(case_name) < 10: continue
-        # Skip navigation links
         if any(x in case_name.lower() for x in ["search", "home", "help", "about", "menu", "login"]): continue
 
         fid = f"ca_{hashlib.md5(case_name.encode()).hexdigest()}"
@@ -1655,9 +1774,7 @@ def check_california_courts(seen):
     return alerts
 
 def check_ny_courts(seen):
-    """Scrape New York Court of Appeals and Appellate Division opinions.
-    NY courts publish recent slip opinions online.
-    Covers financial sector litigation, securities cases."""
+    """Scrape New York Court of Appeals and Appellate Division opinions."""
     url = "https://www.nycourts.gov/ctapps/Decisions/New_Decisions.shtml"
     try:
         resp = requests.get(url, timeout=20, headers={
@@ -1672,7 +1789,6 @@ def check_ny_courts(seen):
         return 0
 
     alerts = 0
-    # Parse opinion links from the page
     entries = re.findall(
         r'href="([^"]*\.(?:pdf|PDF|htm|html)[^"]*)"[^>]*>\s*([^<]{10,200})',
         html
@@ -1712,8 +1828,7 @@ def check_ny_courts(seen):
     return alerts
 
 def check_state_courts(seen, idx):
-    """Rotate through state court scrapers. Each call checks one system.
-    Phase rotation: 0=Delaware, 1=California, 2=New York, then repeat."""
+    """Rotate through state court scrapers. Each call checks one system."""
     sources = [check_delaware_courts, check_california_courts, check_ny_courts]
     fn = sources[idx % len(sources)]
     try:
@@ -1724,14 +1839,7 @@ def check_state_courts(seen, idx):
 
 # ── Government Enforcement Actions (Court Filings) ──
 
-# Search CourtListener for NEW dockets filed BY government agencies.
-# Case names on PACER: "Securities and Exchange Commission v. Tesla Inc",
-# "United States v. Google LLC", "Federal Trade Commission v. Meta Platforms", etc.
-# These are the actual court filings — faster than waiting for press releases.
-
 GOV_AGENCY_SEARCHES = [
-    # (search_query, agency_label) — rotated one per cycle
-    # Federal regulators
     ("Securities and Exchange Commission", "SEC"),
     ("Federal Trade Commission", "FTC"),
     ("Consumer Financial Protection Bureau", "CFPB"),
@@ -1740,15 +1848,12 @@ GOV_AGENCY_SEARCHES = [
     ("Department of Justice", "DOJ"),
     ("National Labor Relations Board", "NLRB"),
     ("Department of Labor", "DOL"),
-    # DOJ as "United States v." — most criminal/civil enforcement
     ("United States of America", "DOJ/USA"),
-    # State attorneys general (file in federal court too)
     ("State of New York", "NY AG"),
     ("State of California", "CA AG"),
     ("State of Texas", "TX AG"),
     ("Commonwealth of Massachusetts", "MA AG"),
     ("People of the State of Illinois", "IL AG"),
-    # Additional federal agencies
     ("Food and Drug Administration", "FDA"),
     ("Federal Energy Regulatory Commission", "FERC"),
     ("Office of the Comptroller", "OCC"),
@@ -1758,14 +1863,10 @@ GOV_AGENCY_SEARCHES = [
 
 
 def check_gov_enforcement(seen, idx):
-    """Search CourtListener for NEW court filings by government agencies.
-    Catches actual PACER filings — much faster than waiting for press releases.
-    Example: 'SEC v. Coinbase' complaint filed in SDNY appears here before sec.gov."""
-
+    """Search CourtListener for NEW court filings by government agencies."""
     agency_query, agency_label = GOV_AGENCY_SEARCHES[idx % len(GOV_AGENCY_SEARCHES)]
     yesterday = (datetime.now(EST) - timedelta(days=2)).strftime("%m/%d/%Y")
 
-    # Search for new dockets with the agency name
     data = cl_request(CL_SEARCH_URL, params={
         "q": f'"{agency_query}"',
         "type": "d",
@@ -1786,9 +1887,8 @@ def check_gov_enforcement(seen, idx):
             continue
         mark_seen(seen, fid)
 
-        # Verify the agency name is actually in the case name (not just snippet)
+        # Verify the agency name is actually in the case name
         if agency_query.lower() not in cn.lower():
-            # For "United States of America", also accept "United States v."
             if agency_label == "DOJ/USA" and "united states" not in cn.lower():
                 continue
             elif agency_label != "DOJ/USA":
@@ -1798,13 +1898,10 @@ def check_gov_enforcement(seen, idx):
         matches = match_public_company(cn)
 
         # Filter out false positives where match is from the agency name, not the defendant
-        # e.g. "Exchange" matching in "Securities and Exchange Commission"
         agency_upper = agency_query.upper()
         matches = [(co, tk) for co, tk in matches if co.upper() not in agency_upper]
 
         if not matches:
-            # Even without a direct ticker match, if a known company name is in the case,
-            # check against buzzy companies
             buzzy_match = None
             for bname, btag in BUZZY_COMPANIES.items():
                 if len(bname) >= 4 and bname.lower() in cn.lower():
@@ -1816,10 +1913,8 @@ def check_gov_enforcement(seen, idx):
 
         log.info(f"GOV ENFORCEMENT [{agency_label}]: {cn[:100]}")
 
-        # Get the filing snippet for context
         snippet = re.sub(r'<[^>]+>', '', item.get("snippet", "") or "").strip()
 
-        # Build summary with available context
         summary_text = (
             f"Government Enforcement Action\n"
             f"Agency: {agency_label} ({agency_query})\n"
@@ -1833,7 +1928,6 @@ def check_gov_enforcement(seen, idx):
         tstr = format_tickers(matches)
         doc_url = get_filing_url(item, "d")
 
-        # Color coding by agency type
         color_map = {
             "SEC": 0x0A3161, "FTC": 0x003366, "DOJ": 0x002868, "DOJ/USA": 0x002868,
             "CFPB": 0x20AA3F, "CFTC": 0xB8860B, "EPA": 0x0071BC, "FDA": 0x0071BC,
@@ -1867,45 +1961,330 @@ def check_gov_enforcement(seen, idx):
 
     return alerts
 
+
+# ── Chinese Court Monitoring (Phase 12-13) ──
+
+def check_sec_edgar_6k(seen, idx):
+    """Monitor SEC EDGAR for 6-K filings from Chinese litigation watchlist companies.
+    Foreign private issuers (like AIXI) must file 6-K forms for material events
+    including court rulings, patent decisions, and litigation updates."""
+
+    watchlist_keys = list(EDGAR_6K_WATCHLIST.keys())
+    if not watchlist_keys:
+        return 0
+
+    ticker = watchlist_keys[idx % len(watchlist_keys)]
+    config = EDGAR_6K_WATCHLIST[ticker]
+    cik = config["cik"]
+    search_terms = config["search_terms"]
+
+    alerts = 0
+
+    # Method 1: EDGAR EFTS full-text search API for 6-K filings
+    # This searches the full text of filings, not just metadata
+    try:
+        efts_url = "https://efts.sec.gov/LATEST/search-index"
+        # Search for company-specific 6-K filings from the last 30 days
+        thirty_days_ago = (datetime.now(tz=pytz.utc) - timedelta(days=30)).strftime("%Y-%m-%d")
+        params = {
+            "q": " OR ".join(f'"{t}"' for t in search_terms[:3]),
+            "dateRange": "custom",
+            "startdt": thirty_days_ago,
+            "forms": "6-K",
+        }
+
+        resp = requests.get(efts_url, params=params, timeout=20, headers={
+            "User-Agent": "CourtFilingMonitor/1.0 (court-monitor@example.com)",
+            "Accept": "application/json"
+        })
+
+        if resp.ok:
+            data = resp.json()
+            hits = data.get("hits", {}).get("hits", [])
+
+            for hit in hits[:5]:
+                source = hit.get("_source", {})
+                filing_id = hit.get("_id", "")
+                file_date = source.get("file_date", "")
+                display_name = source.get("display_names", [""])[0] if source.get("display_names") else ""
+                form_type = source.get("form_type", "6-K")
+
+                fid = f"edgar6k_{hashlib.md5(filing_id.encode()).hexdigest()}"
+                if fid in seen:
+                    continue
+                mark_seen(seen, fid)
+
+                # Build EDGAR filing URL
+                filing_url = f"https://www.sec.gov/cgi-bin/browse-edgar?action=getcompany&CIK={cik}&type=6-K&dateb=&owner=include&count=10"
+                if filing_id:
+                    # Try to construct direct link
+                    filing_url = f"https://www.sec.gov/Archives/edgar/data/{cik.lstrip('0')}/{filing_id}"
+
+                case_info = CHINA_LITIGATION_WATCHLIST.get(ticker, {})
+                log.info(f"🇨🇳 EDGAR 6-K [{ticker}]: {display_name[:80]} filed {file_date}")
+
+                summary_text = (
+                    f"SEC EDGAR 6-K Filing\n"
+                    f"Company: {case_info.get('company', ticker)} (${ticker})\n"
+                    f"Form: {form_type}\n"
+                    f"Filed: {file_date}\n"
+                    f"Context: {case_info.get('case_type', 'Litigation')} - "
+                    f"{case_info.get('company', '')} v. {case_info.get('opponent', '')}\n"
+                    f"Court: {case_info.get('court', 'Unknown')}\n"
+                    f"Status: {case_info.get('status', 'Unknown')}\n"
+                    f"Damages: {case_info.get('damages_claimed', 'Unknown')}"
+                )
+                summary = summarize_with_deepseek(summary_text, "SEC 6-K filing for Chinese court litigation")
+
+                tickers_display = f"**${ticker}** ({case_info.get('company', '')}) | **${case_info.get('opponent_ticker', '')}** ({case_info.get('opponent', '')})"
+
+                embed = {
+                    "title": f"🇨🇳 China Court Filing (6-K): {case_info.get('company', ticker)} — {form_type}",
+                    "url": filing_url,
+                    "color": 0xDE2910,  # Chinese red
+                    "fields": [
+                        {"name": "📊 Tickers", "value": tickers_display, "inline": False},
+                        {"name": "🏛️ Court", "value": case_info.get("court", "Chinese Court"), "inline": True},
+                        {"name": "📅 Filed", "value": file_date, "inline": True},
+                        {"name": "⚖️ Case", "value": f"{case_info.get('case_type', '')} — {case_info.get('status', '')}", "inline": False},
+                        {"name": "💰 Damages", "value": case_info.get("damages_claimed", "Unknown"), "inline": True},
+                        {"name": "📄 Document", "value": f"[View SEC Filing]({filing_url})", "inline": False},
+                        {"name": "🤖 AI Summary", "value": summary[:1000], "inline": False},
+                    ],
+                    "footer": {"text": "China Court Monitor | SEC EDGAR 6-K"},
+                    "timestamp": datetime.now(tz=pytz.utc).isoformat()
+                }
+                send_discord(DISCORD_WEBHOOK_FEDERAL, [embed])
+                alerts += 1
+                time.sleep(0.5)
+        else:
+            log.debug(f"EDGAR EFTS returned {resp.status_code}")
+    except Exception as e:
+        log.debug(f"EDGAR 6-K search failed: {e}")
+
+    # Method 2: EDGAR company filings RSS feed
+    try:
+        rss_url = f"https://www.sec.gov/cgi-bin/browse-edgar?action=getcompany&CIK={cik}&type=6-K&dateb=&owner=include&count=5&search_text=&action=getcompany&output=atom"
+        resp = requests.get(rss_url, timeout=15, headers={
+            "User-Agent": "CourtFilingMonitor/1.0 (court-monitor@example.com)"
+        })
+        if resp.ok:
+            # Simple XML parsing for Atom feed entries
+            entry_pattern = re.compile(r'<entry>(.*?)</entry>', re.DOTALL)
+            title_pattern = re.compile(r'<title[^>]*>([^<]+)</title>')
+            link_pattern = re.compile(r'<link[^>]*href="([^"]+)"')
+            updated_pattern = re.compile(r'<updated>([^<]+)</updated>')
+
+            for entry_match in entry_pattern.finditer(resp.text):
+                entry_xml = entry_match.group(1)
+                title_m = title_pattern.search(entry_xml)
+                link_m = link_pattern.search(entry_xml)
+                updated_m = updated_pattern.search(entry_xml)
+
+                if not title_m or not link_m:
+                    continue
+
+                entry_title = title_m.group(1).strip()
+                entry_link = link_m.group(1).strip()
+                entry_date = updated_m.group(1).strip() if updated_m else ""
+
+                fid = f"edgar6k_rss_{hashlib.md5(entry_link.encode()).hexdigest()}"
+                if fid in seen:
+                    continue
+                mark_seen(seen, fid)
+
+                # Only alert on 6-K filings
+                if "6-K" not in entry_title.upper():
+                    continue
+
+                case_info = CHINA_LITIGATION_WATCHLIST.get(ticker, {})
+                log.info(f"🇨🇳 EDGAR 6-K RSS [{ticker}]: {entry_title[:80]}")
+
+                tickers_display = f"**${ticker}** ({case_info.get('company', '')}) | **${case_info.get('opponent_ticker', '')}** ({case_info.get('opponent', '')})"
+
+                embed = {
+                    "title": f"🇨🇳 China Court (6-K): {case_info.get('company', ticker)}",
+                    "url": entry_link,
+                    "color": 0xDE2910,
+                    "fields": [
+                        {"name": "📊 Tickers", "value": tickers_display, "inline": False},
+                        {"name": "📋 Filing", "value": entry_title[:200], "inline": False},
+                        {"name": "🏛️ Court", "value": case_info.get("court", "Chinese Court"), "inline": True},
+                        {"name": "📅 Date", "value": entry_date[:10], "inline": True},
+                        {"name": "📄 Document", "value": f"[View SEC Filing]({entry_link})", "inline": False},
+                    ],
+                    "footer": {"text": "China Court Monitor | SEC EDGAR RSS"},
+                    "timestamp": datetime.now(tz=pytz.utc).isoformat()
+                }
+                send_discord(DISCORD_WEBHOOK_FEDERAL, [embed])
+                alerts += 1
+                time.sleep(0.5)
+    except Exception as e:
+        log.debug(f"EDGAR RSS check failed: {e}")
+
+    return alerts
+
+
+def check_china_news(seen, idx):
+    """Monitor financial news for Chinese court rulings affecting US-traded stocks.
+    Uses Google News RSS to catch news faster than SEC filings."""
+
+    if not CHINA_NEWS_KEYWORDS:
+        return 0
+
+    # Rotate through search keywords
+    query = CHINA_NEWS_KEYWORDS[idx % len(CHINA_NEWS_KEYWORDS)]
+    alerts = 0
+
+    try:
+        # Google News RSS feed
+        encoded_q = requests.utils.quote(query)
+        news_url = f"https://news.google.com/rss/search?q={encoded_q}&hl=en-US&gl=US&ceid=US:en"
+
+        resp = requests.get(news_url, timeout=15, headers={
+            "User-Agent": "CourtFilingMonitor/1.0"
+        })
+        if not resp.ok:
+            log.debug(f"Google News RSS returned {resp.status_code} for query: {query[:40]}")
+            return 0
+
+        # Parse RSS items
+        item_pattern = re.compile(r'<item>(.*?)</item>', re.DOTALL)
+        title_pattern = re.compile(r'<title>(?:<!\[CDATA\[)?(.*?)(?:\]\]>)?</title>')
+        link_pattern = re.compile(r'<link>(.*?)</link>')
+        pubdate_pattern = re.compile(r'<pubDate>(.*?)</pubDate>')
+
+        for item_match in item_pattern.finditer(resp.text):
+            item_xml = item_match.group(1)
+            title_m = title_pattern.search(item_xml)
+            link_m = link_pattern.search(item_xml)
+            pubdate_m = pubdate_pattern.search(item_xml)
+
+            if not title_m or not link_m:
+                continue
+
+            title = title_m.group(1).strip()
+            link = link_m.group(1).strip()
+            pub_date = pubdate_m.group(1).strip() if pubdate_m else ""
+
+            # Skip old news (more than 3 days)
+            if pub_date:
+                try:
+                    from email.utils import parsedate_to_datetime
+                    news_dt = parsedate_to_datetime(pub_date)
+                    if (datetime.now(tz=pytz.utc) - news_dt).days > 3:
+                        continue
+                except Exception:
+                    pass
+
+            fid = f"china_news_{hashlib.md5((title + link).encode()).hexdigest()}"
+            if fid in seen:
+                continue
+            mark_seen(seen, fid)
+
+            # Check if news matches any watchlist company
+            title_lower = title.lower()
+            matched_case = None
+            for wticker, winfo in CHINA_LITIGATION_WATCHLIST.items():
+                for kw in winfo["keywords"]:
+                    if kw.lower() in title_lower:
+                        matched_case = (wticker, winfo)
+                        break
+                if matched_case:
+                    break
+
+            if not matched_case:
+                # Also check for general company matches
+                matches = match_public_company(title)
+                if not matches:
+                    continue
+                # If it mentions a China-related keyword, alert
+                china_keywords = ["china", "chinese", "shanghai", "beijing", "court", "patent", "ruling", "supreme people"]
+                if not any(ck in title_lower for ck in china_keywords):
+                    continue
+
+            log.info(f"🇨🇳 CHINA NEWS [{query[:25]}]: {title[:80]}")
+
+            if matched_case:
+                wticker, winfo = matched_case
+                tickers_display = f"**${wticker}** ({winfo['company']}) | **${winfo.get('opponent_ticker', '')}** ({winfo.get('opponent', '')})"
+                court_info = winfo.get("court", "Chinese Court")
+            else:
+                tickers_display = format_tickers(matches)
+                court_info = "Chinese Court (from news)"
+
+            summary = summarize_with_deepseek(
+                f"Financial news about Chinese court ruling:\nHeadline: {title}\nQuery: {query}\n"
+                f"Published: {pub_date}\n\nNote: This is from a news source. Verify details from official filings.",
+                "Chinese court ruling news article")
+
+            embed = {
+                "title": f"🇨🇳 China Court News: {title[:200]}",
+                "url": link,
+                "color": 0xDE2910,  # Chinese red
+                "fields": [
+                    {"name": "📊 Tickers", "value": tickers_display, "inline": False},
+                    {"name": "🏛️ Court", "value": court_info, "inline": True},
+                    {"name": "📅 Published", "value": pub_date[:25] if pub_date else "Recent", "inline": True},
+                    {"name": "🔍 Source", "value": "Financial News (Google News)", "inline": True},
+                    {"name": "📄 Article", "value": f"[Read Full Article]({link})", "inline": False},
+                    {"name": "🤖 AI Summary", "value": summary[:1000], "inline": False},
+                ],
+                "footer": {"text": "China Court Monitor | News Watch"},
+                "timestamp": datetime.now(tz=pytz.utc).isoformat()
+            }
+            send_discord(DISCORD_WEBHOOK_FEDERAL, [embed])
+            alerts += 1
+            time.sleep(0.5)
+
+    except Exception as e:
+        log.debug(f"China news check failed: {e}")
+
+    return alerts
+
+
 # ── Main Loop ──
 
 def main():
     global PUBLIC_COMPANIES
-    log.info("="*60)
+    log.info("=" * 60)
     log.info("Court Filing Monitor Starting")
-    log.info(f"  Check interval: {CHECK_INTERVAL}s (12 sources, each every {CHECK_INTERVAL*12}s)")
+    log.info(f"  Base interval: {CHECK_INTERVAL}s (adaptive: 3-15s)")
+    log.info(f"  14 sources, each every ~{CHECK_INTERVAL*14}s")
     log.info(f"  CL Token: {'SET' if COURTLISTENER_API_TOKEN else 'NOT SET - get one at courtlistener.com!'}")
     log.info(f"  Hours: 9AM-4PM EST, market days only")
-    log.info("="*60)
+    log.info(f"  Chinese court monitoring: {len(CHINA_LITIGATION_WATCHLIST)} cases tracked")
+    log.info("=" * 60)
 
     if not COURTLISTENER_API_TOKEN:
         log.warning("COURTLISTENER_API_TOKEN not set! Get free token: https://www.courtlistener.com/sign-in/")
 
     # Load ALL SEC-registered public companies
     PUBLIC_COMPANIES = build_company_db()
-    unique_tickers = len(set(PUBLIC_COMPANIES.values()))
 
     seen = load_seen()
     log.info(f"  Seen file: {SEEN_FILE} ({len(seen)} entries)")
-    cycle = 0; cidx = 0; didx = 0; bidx = 0; sidx = 0; gidx = 0; last_save = time.time()
+    cycle = 0; cidx = 0; didx = 0; bidx = 0; sidx = 0; gidx = 0; eidx = 0; nidx = 0
+    last_save = time.time()
 
     public_count = len(set(v for v in PUBLIC_COMPANIES.values() if not v.startswith("🔥") and not v.startswith("🏛️")))
     private_count = len([k for k, v in BUZZY_COMPANIES.items() if v.startswith("🔥")])
-    startup = {"title":"🟢 Court Filing Monitor Online","description":(
-        f"• Polling: every **{CHECK_INTERVAL}s** (staggered across 12 sources)\n"
+    startup = {"title": "🟢 Court Filing Monitor Online", "description": (
+        f"• Polling: **adaptive** ({CHECK_INTERVAL}s base, 3s peak, 15s throttled)\n"
         f"• Federal courts: **opinions + new dockets** (rulings AND lawsuits)\n"
         f"• 🔴 Macro-market: tariffs, trade, IEEPA, regulatory, antitrust\n"
         f"• 🚨 High-impact: SEC enforcement, DOJ antitrust, class actions\n"
         f"• ⚡ Docket watch: new lawsuits (materiality filtered)\n"
         f"• 🔥 Buzzy privates: OpenAI, xAI, Anthropic, SpaceX, Kalshi, etc.\n"
         f"• 🏛️ State courts: DE Chancery, CA Appellate, NY Court of Appeals\n"
-        f"• ⚖️ Gov enforcement: SEC/DOJ/FTC/CFPB/CFTC/EPA/FDA/state AGs (court filings)\n"
+        f"• ⚖️ Gov enforcement: SEC/DOJ/FTC/CFPB/CFTC/EPA/FDA/state AGs\n"
         f"• Supreme Court: opinions + dockets + supremecourt.gov\n"
         f"• CAFC + CIT: patent rulings + trade court (PDF extraction)\n"
-        f"• Companies: **{public_count}** public tickers + **{private_count}** private\n"
+        f"• 🇨🇳 China courts: SEC EDGAR 6-K + financial news monitoring\n"
+        f"• Companies: **{public_count}** public + **{private_count}** private + **{len(CHINA_LITIGATION_WATCHLIST)}** China cases\n"
         f"• Hours: 9AM-4PM EST\n• CL Auth: {'✅' if COURTLISTENER_API_TOKEN else '⚠️ Not set'}\n"
-        f"• AI: DeepSeek"),
-        "color":0x00FF00,"timestamp":datetime.now(tz=pytz.utc).isoformat()}
+        f"• AI: DeepSeek | Circuit breaker: enabled"),
+        "color": 0x00FF00, "timestamp": datetime.now(tz=pytz.utc).isoformat()}
 
     # Test Discord connectivity on startup
     r1 = send_discord(DISCORD_WEBHOOK_FEDERAL, [startup])
@@ -1917,11 +2296,13 @@ def main():
     if not r2: log.error(f"  SCOTUS webhook URL: {DISCORD_WEBHOOK_SCOTUS[:60]}...")
 
     # If seen file was empty (fresh deploy or first time with volume), do a silent seed cycle
-    # to populate seen dict without spamming Discord
     global SEED_MODE
     if len(seen) == 0:
         SEED_MODE = True
         log.info("🌱 Seed mode: first run with empty seen file — scanning all sources silently first")
+
+    # Total phases including Chinese court monitoring
+    TOTAL_PHASES = 14
 
     while True:
         try:
@@ -1932,7 +2313,7 @@ def main():
                 time.sleep(30)
                 continue
 
-            # Staggered 12-phase cycle at 10s intervals (each source every 120s)
+            # Staggered 14-phase cycle with adaptive intervals
             # Phase 0: Federal opinions (broad)     Phase 1: SCOTUS opinions (CL API)
             # Phase 2: Company opinions (CL API)    Phase 3: SCOTUS docket (CL API)
             # Phase 4: Federal opinions (broad)     Phase 5: SCOTUS website scrape
@@ -1940,7 +2321,9 @@ def main():
             # Phase 8: New docket watch (lawsuits)  Phase 9: Buzzy private companies
             # Phase 10: State court rulings (DE/CA/NY rotation)
             # Phase 11: Gov enforcement (SEC/DOJ/FTC/CFPB/FDA/EPA/AG rotation)
-            phase = cycle % 12
+            # Phase 12: SEC EDGAR 6-K (Chinese court filings)
+            # Phase 13: China news monitor (Google News RSS)
+            phase = cycle % TOTAL_PHASES
 
             if phase in (0, 4):
                 n = check_federal_filings(seen)
@@ -1975,9 +2358,15 @@ def main():
             elif phase == 11:
                 n = check_gov_enforcement(seen, gidx); gidx += 1
                 if n and not SEED_MODE: log.info(f"Sent {n} gov enforcement alerts")
+            elif phase == 12:
+                n = check_sec_edgar_6k(seen, eidx); eidx += 1
+                if n and not SEED_MODE: log.info(f"Sent {n} 🇨🇳 EDGAR 6-K alerts")
+            elif phase == 13:
+                n = check_china_news(seen, nidx); nidx += 1
+                if n and not SEED_MODE: log.info(f"Sent {n} 🇨🇳 China news alerts")
 
-            # After completing first full 12-phase cycle, exit seed mode
-            if SEED_MODE and phase == 11:
+            # After completing first full cycle, exit seed mode
+            if SEED_MODE and cycle >= TOTAL_PHASES - 1:
                 SEED_MODE = False
                 save_seen(seen)
                 log.info(f"✅ Seed complete — {len(seen)} entries tracked. Now alerting normally.")
@@ -1988,10 +2377,11 @@ def main():
                 save_seen(seen); last_save = time.time()
 
             if cycle % 50 == 0:
-                log.info(f"Status: {rate_limiter.remaining()} CL API left | {rate_limiter.per_minute():.0f} req/min | {len(seen)} tracked")
+                log.info(f"Status: {rate_limiter.remaining()} CL API left | {rate_limiter.usage_pct():.0f}% used | {rate_limiter.per_minute():.0f} req/min | {len(seen)} tracked")
 
-            time.sleep(CHECK_INTERVAL)
-            gc.collect()
+            # Adaptive polling interval
+            interval = get_adaptive_interval()
+            time.sleep(interval)
 
         except KeyboardInterrupt:
             log.info("Shutting down..."); save_seen(seen); break
