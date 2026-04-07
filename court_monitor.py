@@ -5,7 +5,8 @@ Monitors:
   1. Federal court filings involving public companies (all federal courts)
   2. Supreme Court opinions/orders mentioning public companies
   3. SEC EDGAR 6-K filings for Chinese/international court rulings
-  4. Financial news for Chinese court rulings affecting US-traded stocks
+  4. Chinese court system sources (Shanghai High Court, SPC, China Justice Observer)
+  5. Health monitoring with Discord alerts
 
 Alerts via Discord webhooks with DeepSeek AI summaries.
 Runs 9 AM - 4 PM EST on market open days only.
@@ -44,6 +45,8 @@ DISCORD_WEBHOOK_MIRROR = os.getenv(
     "DISCORD_WEBHOOK_MIRROR",
     "https://discordapp.com/api/webhooks/1479265927051608086/OXjKNirFTDZDGwgqIiq6zcU8a-mcAEgHmsAA2y71uLK2XYlPJ8dC21C8NKRQH6ZhHQR1"
 )
+# Health alerts webhook — falls back to mirror if not set
+DISCORD_HEALTH_WEBHOOK = os.getenv("DISCORD_HEALTH_WEBHOOK", "") or DISCORD_WEBHOOK_MIRROR
 
 DEEPSEEK_API_KEY = os.getenv("DEEPSEEK_API_KEY", "sk-089099fee3e94c1c97189694645d6f92")
 DEEPSEEK_API_URL = "https://api.deepseek.com/chat/completions"
@@ -83,6 +86,10 @@ class RateLimiter:
                 return False
             if self._circuit_open and time.time() >= self._circuit_open_until:
                 self._circuit_open = False
+                try:
+                    health_monitor.alert_circuit_breaker(False)
+                except NameError:
+                    pass
             self._prune()
             return len(self.requests) < self.max_per_hour
 
@@ -117,6 +124,11 @@ class RateLimiter:
                 self._circuit_open_until = time.time() + wait
                 logging.getLogger("CourtMonitor").warning(
                     f"Circuit breaker OPEN for {wait}s after {self._consecutive_429s} consecutive 429s")
+                # Notify health monitor (avoid circular import by checking existence)
+                try:
+                    health_monitor.alert_circuit_breaker(True, f"{self._consecutive_429s} consecutive 429s, backoff {wait}s")
+                except NameError:
+                    pass  # health_monitor not yet initialized
 
     def record_success(self):
         """Record a successful request — resets 429 counter."""
@@ -128,6 +140,235 @@ class RateLimiter:
         return self.usage_pct() >= 80
 
 rate_limiter = RateLimiter()
+
+# ── Health Monitor ──
+
+class HealthMonitor:
+    """Tracks system health metrics and sends Discord alerts for issues.
+    Alerts are color-coded: green=info, yellow=warning, red=error.
+    Deduplicates alerts with cooldown periods to avoid spam."""
+
+    def __init__(self):
+        self.lock = threading.Lock()
+        self.start_time = time.time()
+        self.total_api_calls = 0
+        self.phase_success = {}   # {phase_name: count}
+        self.phase_failure = {}   # {phase_name: count}
+        self.consecutive_errors = {}  # {phase_name: count}
+        self.api_response_times = deque(maxlen=100)  # last 100 response times
+        self.hourly_api_calls = deque()  # timestamps of API calls this hour
+        self.last_alert_times = {}  # {alert_key: timestamp} for cooldown
+        self.last_summary_time = 0
+        self.errors_since_last_summary = []  # [(time, phase, error_msg)]
+        self._circuit_breaker_opened_at = 0
+
+    def _should_alert(self, alert_key, cooldown_seconds=900):
+        """Check if we should send this alert (15-min cooldown by default)."""
+        now = time.time()
+        last = self.last_alert_times.get(alert_key, 0)
+        if now - last < cooldown_seconds:
+            return False
+        self.last_alert_times[alert_key] = now
+        return True
+
+    def _send_health_alert(self, embed):
+        """Send a health alert to the health webhook. Does not mirror."""
+        if SEED_MODE:
+            return
+        if not DISCORD_HEALTH_WEBHOOK:
+            return
+        try:
+            requests.post(DISCORD_HEALTH_WEBHOOK, json={"embeds": [embed]}, timeout=10)
+        except Exception as e:
+            log.debug(f"Health alert send failed: {e}")
+
+    def record_api_call(self, response_time=None):
+        """Record an API call and optionally its response time."""
+        with self.lock:
+            self.total_api_calls += 1
+            now = time.time()
+            self.hourly_api_calls.append(now)
+            # Prune entries older than 1 hour
+            cutoff = now - 3600
+            while self.hourly_api_calls and self.hourly_api_calls[0] < cutoff:
+                self.hourly_api_calls.popleft()
+            if response_time is not None:
+                self.api_response_times.append(response_time)
+
+    def record_phase_success(self, phase_name):
+        """Record a successful phase execution."""
+        with self.lock:
+            self.phase_success[phase_name] = self.phase_success.get(phase_name, 0) + 1
+            self.consecutive_errors[phase_name] = 0
+
+    def record_phase_failure(self, phase_name, error_msg=""):
+        """Record a failed phase execution. Alerts on 3+ consecutive failures."""
+        with self.lock:
+            self.phase_failure[phase_name] = self.phase_failure.get(phase_name, 0) + 1
+            self.consecutive_errors[phase_name] = self.consecutive_errors.get(phase_name, 0) + 1
+            consec = self.consecutive_errors[phase_name]
+            self.errors_since_last_summary.append((time.time(), phase_name, error_msg[:200]))
+
+        if consec >= 3:
+            alert_key = f"consec_err_{phase_name}"
+            if self._should_alert(alert_key, cooldown_seconds=900):
+                embed = {
+                    "title": "🔴 Consecutive Phase Failures",
+                    "color": 0xFF0000,
+                    "fields": [
+                        {"name": "Phase", "value": phase_name, "inline": True},
+                        {"name": "Consecutive Failures", "value": str(consec), "inline": True},
+                        {"name": "Error", "value": error_msg[:500] or "Unknown", "inline": False},
+                    ],
+                    "footer": {"text": "Health Monitor"},
+                    "timestamp": datetime.now(tz=pytz.utc).isoformat()
+                }
+                self._send_health_alert(embed)
+
+    def check_rate_limit_warning(self):
+        """Alert when CourtListener API usage exceeds 70% of hourly limit."""
+        pct = rate_limiter.usage_pct()
+        remaining = rate_limiter.remaining()
+        if pct >= 70:
+            alert_key = "rate_limit_warning"
+            if self._should_alert(alert_key, cooldown_seconds=900):
+                # Project usage: current rate * 60 minutes
+                per_min = rate_limiter.per_minute()
+                projected = int(per_min * 60)
+                color = 0xFF0000 if pct >= 90 else 0xFFFF00
+                embed = {
+                    "title": "🟡 Rate Limit Warning" if pct < 90 else "🔴 Rate Limit Critical",
+                    "color": color,
+                    "fields": [
+                        {"name": "Current Usage", "value": f"{pct:.0f}% ({rate_limiter.max_per_hour - remaining}/{rate_limiter.max_per_hour})", "inline": True},
+                        {"name": "Remaining", "value": str(remaining), "inline": True},
+                        {"name": "Projected (hour)", "value": f"~{projected} calls", "inline": True},
+                    ],
+                    "footer": {"text": "Health Monitor"},
+                    "timestamp": datetime.now(tz=pytz.utc).isoformat()
+                }
+                self._send_health_alert(embed)
+
+    def alert_429(self, api_name, endpoint, retry_after=None):
+        """Immediately alert on 429 rate limit response."""
+        alert_key = f"429_{api_name}"
+        if self._should_alert(alert_key, cooldown_seconds=300):
+            embed = {
+                "title": "🔴 429 Rate Limited",
+                "color": 0xFF0000,
+                "fields": [
+                    {"name": "API", "value": api_name, "inline": True},
+                    {"name": "Endpoint", "value": endpoint[:200], "inline": True},
+                    {"name": "Retry-After", "value": f"{retry_after}s" if retry_after else "Unknown", "inline": True},
+                ],
+                "footer": {"text": "Health Monitor"},
+                "timestamp": datetime.now(tz=pytz.utc).isoformat()
+            }
+            self._send_health_alert(embed)
+
+    def alert_circuit_breaker(self, opened, reason=""):
+        """Alert when circuit breaker opens or closes."""
+        if opened:
+            self._circuit_breaker_opened_at = time.time()
+            alert_key = "circuit_breaker_open"
+            if self._should_alert(alert_key, cooldown_seconds=300):
+                embed = {
+                    "title": "🔴 Circuit Breaker OPENED",
+                    "color": 0xFF0000,
+                    "fields": [
+                        {"name": "Reason", "value": reason[:500] or "Rate limit threshold exceeded", "inline": False},
+                    ],
+                    "footer": {"text": "Health Monitor"},
+                    "timestamp": datetime.now(tz=pytz.utc).isoformat()
+                }
+                self._send_health_alert(embed)
+        else:
+            duration = time.time() - self._circuit_breaker_opened_at if self._circuit_breaker_opened_at else 0
+            alert_key = "circuit_breaker_close"
+            if self._should_alert(alert_key, cooldown_seconds=60):
+                embed = {
+                    "title": "🟢 Circuit Breaker Closed",
+                    "color": 0x00FF00,
+                    "fields": [
+                        {"name": "Duration", "value": f"{duration:.0f}s" if duration else "Unknown", "inline": True},
+                    ],
+                    "footer": {"text": "Health Monitor"},
+                    "timestamp": datetime.now(tz=pytz.utc).isoformat()
+                }
+                self._send_health_alert(embed)
+
+    def alert_connectivity(self, service, error_type, error_msg):
+        """Alert on connection timeouts, DNS failures, or SSL errors."""
+        alert_key = f"connectivity_{service}"
+        if self._should_alert(alert_key, cooldown_seconds=900):
+            embed = {
+                "title": "🔴 API Connectivity Issue",
+                "color": 0xFF0000,
+                "fields": [
+                    {"name": "Service", "value": service, "inline": True},
+                    {"name": "Error Type", "value": error_type, "inline": True},
+                    {"name": "Details", "value": error_msg[:500], "inline": False},
+                ],
+                "footer": {"text": "Health Monitor"},
+                "timestamp": datetime.now(tz=pytz.utc).isoformat()
+            }
+            self._send_health_alert(embed)
+
+    def maybe_send_summary(self):
+        """Send a 2-hour health summary during trading hours."""
+        now = time.time()
+        if now - self.last_summary_time < 7200:  # 2 hours
+            return
+        if not is_market_hours():
+            return
+        self.last_summary_time = now
+
+        uptime_s = now - self.start_time
+        hours = int(uptime_s // 3600)
+        minutes = int((uptime_s % 3600) // 60)
+
+        with self.lock:
+            hourly_calls = len(self.hourly_api_calls)
+            avg_response = 0.0
+            if self.api_response_times:
+                avg_response = sum(self.api_response_times) / len(self.api_response_times)
+            total_successes = sum(self.phase_success.values())
+            total_failures = sum(self.phase_failure.values())
+            recent_errors = [(t, p, e) for t, p, e in self.errors_since_last_summary if now - t < 7200]
+            self.errors_since_last_summary = []
+
+        remaining = rate_limiter.remaining()
+        pct = rate_limiter.usage_pct()
+
+        error_summary = "None"
+        if recent_errors:
+            error_lines = []
+            for _, phase, msg in recent_errors[-5:]:
+                error_lines.append(f"• {phase}: {msg[:80]}")
+            error_summary = "\n".join(error_lines)
+
+        slow_flag = ""
+        if avg_response > 5.0:
+            slow_flag = " ⚠️ SLOW"
+
+        embed = {
+            "title": "🟢 System Health Summary",
+            "color": 0x00FF00 if total_failures == 0 else 0xFFFF00,
+            "fields": [
+                {"name": "Uptime", "value": f"{hours}h {minutes}m", "inline": True},
+                {"name": "API Calls (hour)", "value": str(hourly_calls), "inline": True},
+                {"name": "Rate Limit", "value": f"{remaining} left ({pct:.0f}% used)", "inline": True},
+                {"name": "Phases Completed", "value": str(total_successes), "inline": True},
+                {"name": "Phase Failures", "value": str(total_failures), "inline": True},
+                {"name": "Avg Response", "value": f"{avg_response:.1f}s{slow_flag}", "inline": True},
+                {"name": "Errors (2h window)", "value": error_summary[:500], "inline": False},
+            ],
+            "footer": {"text": "Health Monitor | 2-hour summary"},
+            "timestamp": datetime.now(tz=pytz.utc).isoformat()
+        }
+        self._send_health_alert(embed)
+
+health_monitor = HealthMonitor()
 
 # ── Market Holidays ──
 # US stock market holidays (NYSE/NASDAQ) for 2025-2027
@@ -260,19 +501,24 @@ BUZZY_COMPANIES = {
 
 # ── Chinese Litigation Watchlist ──
 # Cases in Chinese courts affecting US-traded stocks.
-# Used by SEC EDGAR 6-K monitor and news monitor.
+# Used by SEC EDGAR 6-K monitor, Chinese court scrapers, and news monitor.
+# Each case includes both English and Chinese search terms for bilingual monitoring.
 CHINA_LITIGATION_WATCHLIST = {
-    "AIXI": {
+    "AIXI_v_AAPL": {
+        "tickers": ["AIXI", "AAPL"],
         "company": "Xiao-I Corporation",
         "ticker": "AIXI",
         "opponent": "Apple Inc.",
         "opponent_ticker": "AAPL",
+        "english_terms": ["Xiao-I", "AIXI", "Apple", "patent infringement", "Shanghai High Court"],
+        "chinese_terms": ["\u82f9\u679c", "\u5c0fi\u673a\u5668\u4eba", "\u4e13\u5229\u4fb5\u6743", "\u4e0a\u6d77\u5e02\u9ad8\u7ea7\u4eba\u6c11\u6cd5\u9662"],
         "court": "Shanghai High People's Court",
-        "case_type": "Patent infringement",
+        "case_type": "Patent Infringement - Damages Phase",
+        "claimed_damages": "$1.4 billion",
         "status": "Damages phase — patents declared permanently valid by Supreme People's Court (Mar 2026)",
-        "damages_claimed": "$1.4 billion",
+        "description": "Xiao-I vs Apple AI patent infringement. Patents validated by Supreme People's Court March 2026. Damages phase ongoing.",
         "keywords": ["xiao-i", "xiaoai", "AIXI", "shanghai court", "shanghai high people"],
-        "sec_cik": "0001866757",  # Xiao-I CIK for EDGAR searches
+        "sec_cik": "0001866757",
     },
 }
 
@@ -284,7 +530,17 @@ EDGAR_6K_WATCHLIST = {
     },
 }
 
-# News keywords for Chinese court monitoring
+def _get_watchlist_by_ticker(ticker):
+    """Look up CHINA_LITIGATION_WATCHLIST by ticker (searches tickers list and legacy ticker field)."""
+    for case_key, info in CHINA_LITIGATION_WATCHLIST.items():
+        if ticker in info.get("tickers", []):
+            return info
+        if info.get("ticker") == ticker:
+            return info
+    return {}
+
+# Legacy news keywords — kept for reference but no longer used by Google News RSS
+# Chinese court monitoring now uses direct court website scrapers (Phases 13-15)
 CHINA_NEWS_KEYWORDS = [
     '"Shanghai court" Apple',
     '"Xiao-I" court ruling',
@@ -544,14 +800,19 @@ def get_cl_headers():
 def cl_request(url, params=None, timeout=20):
     if not rate_limiter.can_request():
         log.warning(f"Rate limit nearing ({rate_limiter.remaining()} left). Pausing 30s...")
+        health_monitor.check_rate_limit_warning()
         time.sleep(30)
         if not rate_limiter.can_request():
             log.error("Rate limit exhausted. Skipping.")
             return None
     rate_limiter.record()
+    health_monitor.record_api_call()
     for attempt in range(3):
         try:
+            t0 = time.time()
             resp = requests.get(url, params=params, headers=get_cl_headers(), timeout=timeout)
+            elapsed = time.time() - t0
+            health_monitor.record_api_call(response_time=elapsed)
             if resp.status_code == 429:
                 rate_limiter.record_429()
                 # Exponential backoff: use Retry-After header or 60 * 2^attempt
@@ -560,6 +821,7 @@ def cl_request(url, params=None, timeout=20):
                     retry_after = int(resp.headers.get("Retry-After", 60))
                 except (ValueError, TypeError):
                     pass
+                health_monitor.alert_429("CourtListener", url[:100], retry_after)
                 wait = min(retry_after * (2 ** attempt), 300)
                 log.warning(f"CL 429 - exponential backoff {wait}s (attempt {attempt+1})")
                 time.sleep(wait)
@@ -572,9 +834,18 @@ def cl_request(url, params=None, timeout=20):
             return resp.json()
         except requests.exceptions.Timeout:
             log.warning(f"CL timeout (attempt {attempt+1})")
+            health_monitor.alert_connectivity("CourtListener", "Timeout", f"Request timed out after {timeout}s: {url[:100]}")
+            time.sleep(5 * (attempt + 1))
+        except requests.exceptions.ConnectionError as e:
+            log.error(f"CL connection error: {e}")
+            health_monitor.alert_connectivity("CourtListener", "ConnectionError", str(e)[:300])
             time.sleep(5 * (attempt + 1))
         except requests.exceptions.RequestException as e:
             log.error(f"CL request failed: {e}")
+            err_type = type(e).__name__
+            if "SSL" in str(e) or "ssl" in str(e):
+                err_type = "SSLError"
+            health_monitor.alert_connectivity("CourtListener", err_type, str(e)[:300])
             time.sleep(5 * (attempt + 1))
     return None
 
@@ -2020,7 +2291,7 @@ def check_sec_edgar_6k(seen, idx):
                     # Try to construct direct link
                     filing_url = f"https://www.sec.gov/Archives/edgar/data/{cik.lstrip('0')}/{filing_id}"
 
-                case_info = CHINA_LITIGATION_WATCHLIST.get(ticker, {})
+                case_info = _get_watchlist_by_ticker(ticker)
                 log.info(f"🇨🇳 EDGAR 6-K [{ticker}]: {display_name[:80]} filed {file_date}")
 
                 summary_text = (
@@ -2032,7 +2303,7 @@ def check_sec_edgar_6k(seen, idx):
                     f"{case_info.get('company', '')} v. {case_info.get('opponent', '')}\n"
                     f"Court: {case_info.get('court', 'Unknown')}\n"
                     f"Status: {case_info.get('status', 'Unknown')}\n"
-                    f"Damages: {case_info.get('damages_claimed', 'Unknown')}"
+                    f"Damages: {case_info.get('claimed_damages', case_info.get('damages_claimed', 'Unknown'))}"
                 )
                 summary = summarize_with_deepseek(summary_text, "SEC 6-K filing for Chinese court litigation")
 
@@ -2097,7 +2368,7 @@ def check_sec_edgar_6k(seen, idx):
                 if "6-K" not in entry_title.upper():
                     continue
 
-                case_info = CHINA_LITIGATION_WATCHLIST.get(ticker, {})
+                case_info = _get_watchlist_by_ticker(ticker)
                 log.info(f"🇨🇳 EDGAR 6-K RSS [{ticker}]: {entry_title[:80]}")
 
                 tickers_display = f"**${ticker}** ({case_info.get('company', '')}) | **${case_info.get('opponent_ticker', '')}** ({case_info.get('opponent', '')})"
@@ -2125,120 +2396,400 @@ def check_sec_edgar_6k(seen, idx):
     return alerts
 
 
-def check_china_news(seen, idx):
-    """Monitor financial news for Chinese court rulings affecting US-traded stocks.
-    Uses Google News RSS to catch news faster than SEC filings."""
+def _match_watchlist_text(text):
+    """Check text against CHINA_LITIGATION_WATCHLIST English and Chinese terms.
+    Returns (case_key, case_info) or None."""
+    if not text:
+        return None
+    text_lower = text.lower()
+    for case_key, case_info in CHINA_LITIGATION_WATCHLIST.items():
+        # Check English terms
+        for term in case_info.get("english_terms", []):
+            if term.lower() in text_lower:
+                return (case_key, case_info)
+        # Check Chinese terms
+        for term in case_info.get("chinese_terms", []):
+            if term in text:
+                return (case_key, case_info)
+        # Legacy keywords field
+        for kw in case_info.get("keywords", []):
+            if kw.lower() in text_lower:
+                return (case_key, case_info)
+    return None
 
-    if not CHINA_NEWS_KEYWORDS:
-        return 0
 
-    # Rotate through search keywords
-    query = CHINA_NEWS_KEYWORDS[idx % len(CHINA_NEWS_KEYWORDS)]
+def _build_china_embed(title, url, source_label, case_info, extra_text="", date_str=""):
+    """Build a standardized Discord embed for Chinese court alerts."""
+    if case_info:
+        tickers = case_info.get("tickers", [case_info.get("ticker", ""), case_info.get("opponent_ticker", "")])
+        tickers_display = " | ".join(f"**${t}**" for t in tickers if t)
+        company_names = f"{case_info.get('company', '')} v. {case_info.get('opponent', '')}"
+        if tickers_display and company_names:
+            tickers_display += f" ({company_names})"
+        court_name = case_info.get("court", "Chinese Court")
+        case_type = case_info.get("case_type", "")
+    else:
+        tickers_display = "Chinese Court Update"
+        court_name = "Chinese Court"
+        case_type = ""
+
+    summary_input = f"Chinese court update from {source_label}:\n{title}\n"
+    if case_type:
+        summary_input += f"Case type: {case_type}\n"
+    if extra_text:
+        summary_input += f"\n{extra_text[:3000]}"
+    summary = summarize_with_deepseek(summary_input, f"Chinese court update from {source_label}")
+
+    embed = {
+        "title": f"\U0001f1e8\U0001f1f3 {source_label}: {title[:200]}",
+        "url": url,
+        "color": 0xDE2910,
+        "fields": [
+            {"name": "\U0001f4ca Tickers", "value": tickers_display, "inline": False},
+            {"name": "\U0001f3db\ufe0f Court", "value": court_name, "inline": True},
+            {"name": "\U0001f50d Source", "value": source_label, "inline": True},
+        ],
+        "footer": {"text": f"China Court Monitor | {source_label}"},
+        "timestamp": datetime.now(tz=pytz.utc).isoformat()
+    }
+    if date_str:
+        embed["fields"].append({"name": "\U0001f4c5 Date", "value": date_str[:25], "inline": True})
+    if case_type:
+        embed["fields"].append({"name": "\u2696\ufe0f Case", "value": case_type, "inline": False})
+    embed["fields"].append({"name": "\U0001f4c4 Document", "value": f"[View Source]({url})", "inline": False})
+    embed["fields"].append({"name": "\U0001f916 AI Summary", "value": summary[:1000], "inline": False})
+    return embed
+
+
+def check_shanghai_court(seen):
+    """Phase 13: Scrape Shanghai High People's Court website (hshfy.sh.cn)
+    for announcements related to tracked cases. This is the court handling
+    the AIXI v Apple damages ruling.
+
+    Chinese government websites may be slow — uses 20s timeout.
+    Handles Chinese character encoding (UTF-8)."""
+
     alerts = 0
+    # URLs to check on the Shanghai court website
+    urls_to_check = [
+        ("http://www.hshfy.sh.cn", "Shanghai Court Main"),
+        ("https://www.hshfy.sh.cn/shfy/English/MapView.jsp", "Shanghai Court English"),
+    ]
 
-    try:
-        # Google News RSS feed
-        encoded_q = requests.utils.quote(query)
-        news_url = f"https://news.google.com/rss/search?q={encoded_q}&hl=en-US&gl=US&ceid=US:en"
-
-        resp = requests.get(news_url, timeout=15, headers={
-            "User-Agent": "CourtFilingMonitor/1.0"
-        })
-        if not resp.ok:
-            log.debug(f"Google News RSS returned {resp.status_code} for query: {query[:40]}")
-            return 0
-
-        # Parse RSS items
-        item_pattern = re.compile(r'<item>(.*?)</item>', re.DOTALL)
-        title_pattern = re.compile(r'<title>(?:<!\[CDATA\[)?(.*?)(?:\]\]>)?</title>')
-        link_pattern = re.compile(r'<link>(.*?)</link>')
-        pubdate_pattern = re.compile(r'<pubDate>(.*?)</pubDate>')
-
-        for item_match in item_pattern.finditer(resp.text):
-            item_xml = item_match.group(1)
-            title_m = title_pattern.search(item_xml)
-            link_m = link_pattern.search(item_xml)
-            pubdate_m = pubdate_pattern.search(item_xml)
-
-            if not title_m or not link_m:
+    for page_url, page_label in urls_to_check:
+        try:
+            resp = requests.get(page_url, timeout=20, headers={
+                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+                "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+                "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8",
+                "Accept-Encoding": "gzip, deflate",
+            })
+            if not resp.ok:
+                log.debug(f"Shanghai court ({page_label}) returned {resp.status_code}")
                 continue
 
-            title = title_m.group(1).strip()
-            link = link_m.group(1).strip()
-            pub_date = pubdate_m.group(1).strip() if pubdate_m else ""
+            # Handle encoding — Chinese sites often use GB2312/GBK
+            resp.encoding = resp.apparent_encoding or 'utf-8'
+            html = resp.text
 
-            # Skip old news (more than 3 days)
-            if pub_date:
-                try:
-                    from email.utils import parsedate_to_datetime
-                    news_dt = parsedate_to_datetime(pub_date)
-                    if (datetime.now(tz=pytz.utc) - news_dt).days > 3:
+            # Extract links and text content from the page
+            # Look for announcement links with titles
+            link_pattern = re.compile(
+                r'<a[^>]+href=["\']([^"\']+)["\'][^>]*>([^<]{4,200})</a>',
+                re.IGNORECASE
+            )
+
+            for link_match in link_pattern.finditer(html):
+                href = link_match.group(1).strip()
+                link_text = link_match.group(2).strip()
+
+                if not link_text or len(link_text) < 4:
+                    continue
+                # Skip navigation/menu links
+                if any(skip in link_text.lower() for skip in [
+                    "javascript", "mailto", "#", "css", "login", "register",
+                    "home", "sitemap", "contact",
+                ]):
+                    continue
+
+                # Check if this link text matches any watchlist terms
+                matched = _match_watchlist_text(link_text)
+                if not matched:
+                    continue
+
+                case_key, case_info = matched
+
+                # Build full URL
+                if href.startswith("/"):
+                    full_url = f"http://www.hshfy.sh.cn{href}"
+                elif href.startswith("http"):
+                    full_url = href
+                else:
+                    full_url = f"http://www.hshfy.sh.cn/{href}"
+
+                fid = f"shanghai_{hashlib.md5((link_text + href).encode()).hexdigest()}"
+                if fid in seen:
+                    continue
+                mark_seen(seen, fid)
+
+                log.info(f"\U0001f1e8\U0001f1f3 SHANGHAI COURT [{page_label}]: {link_text[:80]}")
+
+                embed = _build_china_embed(
+                    title=link_text,
+                    url=full_url,
+                    source_label="Shanghai High People's Court",
+                    case_info=case_info,
+                    extra_text=f"Found on: {page_label}\nLink text: {link_text}",
+                )
+                send_discord(DISCORD_WEBHOOK_FEDERAL, [embed])
+                alerts += 1
+                time.sleep(0.5)
+
+        except requests.exceptions.Timeout:
+            log.debug(f"Shanghai court ({page_label}) timeout (expected for Chinese govt sites)")
+        except requests.exceptions.ConnectionError as e:
+            log.debug(f"Shanghai court ({page_label}) connection error: {e}")
+        except Exception as e:
+            log.debug(f"Shanghai court ({page_label}) failed: {e}")
+
+    return alerts
+
+
+def check_spc_court(seen):
+    """Phase 14: Monitor Supreme People's Court of China website
+    (english.court.gov.cn) for news and announcements matching tracked cases.
+
+    Uses 20s timeout for Chinese government sites."""
+
+    alerts = 0
+    urls_to_check = [
+        ("https://english.court.gov.cn", "SPC English"),
+        ("https://english.court.gov.cn/2024-01/01/list_news.htm", "SPC English News"),
+    ]
+
+    for page_url, page_label in urls_to_check:
+        try:
+            resp = requests.get(page_url, timeout=20, headers={
+                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+                "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+                "Accept-Language": "en-US,en;q=0.9,zh-CN;q=0.8",
+                "Accept-Encoding": "gzip, deflate",
+            })
+            if not resp.ok:
+                log.debug(f"SPC ({page_label}) returned {resp.status_code}")
+                continue
+
+            resp.encoding = resp.apparent_encoding or 'utf-8'
+            html = resp.text
+
+            # Extract article/news links
+            link_pattern = re.compile(
+                r'<a[^>]+href=["\']([^"\']+)["\'][^>]*>([^<]{4,300})</a>',
+                re.IGNORECASE
+            )
+
+            for link_match in link_pattern.finditer(html):
+                href = link_match.group(1).strip()
+                link_text = link_match.group(2).strip()
+
+                if not link_text or len(link_text) < 5:
+                    continue
+                if any(skip in link_text.lower() for skip in [
+                    "javascript", "mailto", "#", "css", "login",
+                    "sitemap", "contact", "home page",
+                ]):
+                    continue
+
+                # Check against watchlist terms (English + Chinese)
+                matched = _match_watchlist_text(link_text)
+                if not matched:
+                    # Also check for broader keywords relevant to US-traded companies
+                    text_lower = link_text.lower()
+                    ip_keywords = ["patent", "intellectual property", "infringement",
+                                   "apple", "xiao-i", "aixi"]
+                    if not any(kw in text_lower for kw in ip_keywords):
                         continue
+                    matched = (None, None)
+
+                case_key = matched[0] if matched else None
+                case_info = matched[1] if matched else None
+
+                # Build full URL
+                if href.startswith("/"):
+                    full_url = f"https://english.court.gov.cn{href}"
+                elif href.startswith("http"):
+                    full_url = href
+                else:
+                    full_url = f"https://english.court.gov.cn/{href}"
+
+                fid = f"spc_{hashlib.md5((link_text + href).encode()).hexdigest()}"
+                if fid in seen:
+                    continue
+                mark_seen(seen, fid)
+
+                log.info(f"\U0001f1e8\U0001f1f3 SPC [{page_label}]: {link_text[:80]}")
+
+                # Try to fetch the article content for a better summary
+                article_text = ""
+                try:
+                    art_resp = requests.get(full_url, timeout=15, headers={
+                        "User-Agent": "Mozilla/5.0 (compatible; CourtMonitor/1.0)",
+                        "Accept-Language": "en-US,en;q=0.9",
+                    })
+                    if art_resp.ok:
+                        art_resp.encoding = art_resp.apparent_encoding or 'utf-8'
+                        # Strip HTML tags for text content
+                        article_text = re.sub(r'<[^>]+>', ' ', art_resp.text)
+                        article_text = re.sub(r'\s+', ' ', article_text).strip()[:3000]
                 except Exception:
                     pass
 
-            fid = f"china_news_{hashlib.md5((title + link).encode()).hexdigest()}"
-            if fid in seen:
+                embed = _build_china_embed(
+                    title=link_text,
+                    url=full_url,
+                    source_label="Supreme People's Court",
+                    case_info=case_info,
+                    extra_text=article_text,
+                )
+                send_discord(DISCORD_WEBHOOK_FEDERAL, [embed])
+                alerts += 1
+                time.sleep(0.5)
+
+        except requests.exceptions.Timeout:
+            log.debug(f"SPC ({page_label}) timeout")
+        except requests.exceptions.ConnectionError as e:
+            log.debug(f"SPC ({page_label}) connection error: {e}")
+        except Exception as e:
+            log.debug(f"SPC ({page_label}) failed: {e}")
+
+    return alerts
+
+
+def check_china_justice_observer(seen):
+    """Phase 15: Monitor China Justice Observer (chinajusticeobserver.com)
+    for articles about Chinese court rulings affecting US-traded companies.
+
+    This is the best English-language source for Chinese court ruling coverage."""
+
+    alerts = 0
+    urls_to_check = [
+        ("https://www.chinajusticeobserver.com", "CJO Main"),
+        ("https://www.chinajusticeobserver.com/news", "CJO News"),
+        ("https://www.chinajusticeobserver.com/insights", "CJO Insights"),
+    ]
+
+    for page_url, page_label in urls_to_check:
+        try:
+            resp = requests.get(page_url, timeout=15, headers={
+                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+                "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+                "Accept-Language": "en-US,en;q=0.9",
+            })
+            if not resp.ok:
+                log.debug(f"CJO ({page_label}) returned {resp.status_code}")
                 continue
-            mark_seen(seen, fid)
 
-            # Check if news matches any watchlist company
-            title_lower = title.lower()
-            matched_case = None
-            for wticker, winfo in CHINA_LITIGATION_WATCHLIST.items():
-                for kw in winfo["keywords"]:
-                    if kw.lower() in title_lower:
-                        matched_case = (wticker, winfo)
-                        break
-                if matched_case:
-                    break
+            resp.encoding = 'utf-8'
+            html = resp.text
 
-            if not matched_case:
-                # Also check for general company matches
-                matches = match_public_company(title)
-                if not matches:
+            # Extract article links — CJO uses clean URLs for articles
+            link_pattern = re.compile(
+                r'<a[^>]+href=["\']([^"\']*(?:/a/|/t/|/news/|/insights/)[^"\']*)["\'][^>]*>'
+                r'\s*(?:<[^>]*>)*\s*([^<]{5,300})',
+                re.IGNORECASE
+            )
+
+            # Also try a broader pattern for article titles
+            broad_pattern = re.compile(
+                r'<a[^>]+href=["\']([^"\']+)["\'][^>]*>([^<]{10,300})</a>',
+                re.IGNORECASE
+            )
+
+            seen_links = set()
+            all_matches = list(link_pattern.finditer(html)) + list(broad_pattern.finditer(html))
+
+            for link_match in all_matches:
+                href = link_match.group(1).strip()
+                link_text = link_match.group(2).strip()
+
+                if href in seen_links:
                     continue
-                # If it mentions a China-related keyword, alert
-                china_keywords = ["china", "chinese", "shanghai", "beijing", "court", "patent", "ruling", "supreme people"]
-                if not any(ck in title_lower for ck in china_keywords):
+                seen_links.add(href)
+
+                if not link_text or len(link_text) < 8:
+                    continue
+                if any(skip in link_text.lower() for skip in [
+                    "javascript", "mailto", "#", "css", "login", "subscribe",
+                    "about us", "contact", "privacy", "terms",
+                ]):
+                    continue
+                # Skip non-article links
+                if any(skip in href.lower() for skip in [
+                    ".css", ".js", ".png", ".jpg", "javascript:", "mailto:",
+                ]):
                     continue
 
-            log.info(f"🇨🇳 CHINA NEWS [{query[:25]}]: {title[:80]}")
+                # Check against watchlist terms
+                matched = _match_watchlist_text(link_text)
+                if not matched:
+                    # Check broader keywords
+                    text_lower = link_text.lower()
+                    relevant_keywords = [
+                        "patent", "intellectual property", "infringement",
+                        "apple", "xiao-i", "aixi", "shanghai",
+                        "damages", "ruling", "verdict", "judgment",
+                        "technology", "us company", "foreign company",
+                    ]
+                    if not any(kw in text_lower for kw in relevant_keywords):
+                        continue
+                    matched = (None, None)
 
-            if matched_case:
-                wticker, winfo = matched_case
-                tickers_display = f"**${wticker}** ({winfo['company']}) | **${winfo.get('opponent_ticker', '')}** ({winfo.get('opponent', '')})"
-                court_info = winfo.get("court", "Chinese Court")
-            else:
-                tickers_display = format_tickers(matches)
-                court_info = "Chinese Court (from news)"
+                case_key = matched[0] if matched else None
+                case_info = matched[1] if matched else None
 
-            summary = summarize_with_deepseek(
-                f"Financial news about Chinese court ruling:\nHeadline: {title}\nQuery: {query}\n"
-                f"Published: {pub_date}\n\nNote: This is from a news source. Verify details from official filings.",
-                "Chinese court ruling news article")
+                # Build full URL
+                if href.startswith("/"):
+                    full_url = f"https://www.chinajusticeobserver.com{href}"
+                elif href.startswith("http"):
+                    full_url = href
+                else:
+                    full_url = f"https://www.chinajusticeobserver.com/{href}"
 
-            embed = {
-                "title": f"🇨🇳 China Court News: {title[:200]}",
-                "url": link,
-                "color": 0xDE2910,  # Chinese red
-                "fields": [
-                    {"name": "📊 Tickers", "value": tickers_display, "inline": False},
-                    {"name": "🏛️ Court", "value": court_info, "inline": True},
-                    {"name": "📅 Published", "value": pub_date[:25] if pub_date else "Recent", "inline": True},
-                    {"name": "🔍 Source", "value": "Financial News (Google News)", "inline": True},
-                    {"name": "📄 Article", "value": f"[Read Full Article]({link})", "inline": False},
-                    {"name": "🤖 AI Summary", "value": summary[:1000], "inline": False},
-                ],
-                "footer": {"text": "China Court Monitor | News Watch"},
-                "timestamp": datetime.now(tz=pytz.utc).isoformat()
-            }
-            send_discord(DISCORD_WEBHOOK_FEDERAL, [embed])
-            alerts += 1
-            time.sleep(0.5)
+                fid = f"cjo_{hashlib.md5((link_text + href).encode()).hexdigest()}"
+                if fid in seen:
+                    continue
+                mark_seen(seen, fid)
 
-    except Exception as e:
-        log.debug(f"China news check failed: {e}")
+                log.info(f"\U0001f1e8\U0001f1f3 CJO [{page_label}]: {link_text[:80]}")
+
+                # Try to fetch article content for summary
+                article_text = ""
+                try:
+                    art_resp = requests.get(full_url, timeout=15, headers={
+                        "User-Agent": "Mozilla/5.0 (compatible; CourtMonitor/1.0)",
+                    })
+                    if art_resp.ok:
+                        art_resp.encoding = 'utf-8'
+                        article_text = re.sub(r'<[^>]+>', ' ', art_resp.text)
+                        article_text = re.sub(r'\s+', ' ', article_text).strip()[:3000]
+                except Exception:
+                    pass
+
+                embed = _build_china_embed(
+                    title=link_text,
+                    url=full_url,
+                    source_label="China Justice Observer",
+                    case_info=case_info,
+                    extra_text=article_text,
+                )
+                send_discord(DISCORD_WEBHOOK_FEDERAL, [embed])
+                alerts += 1
+                time.sleep(0.5)
+
+        except requests.exceptions.Timeout:
+            log.debug(f"CJO ({page_label}) timeout")
+        except Exception as e:
+            log.debug(f"CJO ({page_label}) failed: {e}")
 
     return alerts
 
@@ -2247,13 +2798,15 @@ def check_china_news(seen, idx):
 
 def main():
     global PUBLIC_COMPANIES
+    TOTAL_PHASES = 16
     log.info("=" * 60)
     log.info("Court Filing Monitor Starting")
     log.info(f"  Base interval: {CHECK_INTERVAL}s (adaptive: 3-15s)")
-    log.info(f"  14 sources, each every ~{CHECK_INTERVAL*14}s")
+    log.info(f"  {TOTAL_PHASES} sources, each every ~{CHECK_INTERVAL*TOTAL_PHASES}s")
     log.info(f"  CL Token: {'SET' if COURTLISTENER_API_TOKEN else 'NOT SET - get one at courtlistener.com!'}")
     log.info(f"  Hours: 9AM-4PM EST, market days only")
     log.info(f"  Chinese court monitoring: {len(CHINA_LITIGATION_WATCHLIST)} cases tracked")
+    log.info(f"  Health webhook: {'SET' if DISCORD_HEALTH_WEBHOOK else 'NOT SET'}")
     log.info("=" * 60)
 
     if not COURTLISTENER_API_TOKEN:
@@ -2264,7 +2817,7 @@ def main():
 
     seen = load_seen()
     log.info(f"  Seen file: {SEEN_FILE} ({len(seen)} entries)")
-    cycle = 0; cidx = 0; didx = 0; bidx = 0; sidx = 0; gidx = 0; eidx = 0; nidx = 0
+    cycle = 0; cidx = 0; didx = 0; bidx = 0; sidx = 0; gidx = 0; eidx = 0
     last_save = time.time()
 
     public_count = len(set(v for v in PUBLIC_COMPANIES.values() if not v.startswith("🔥") and not v.startswith("🏛️")))
@@ -2280,7 +2833,8 @@ def main():
         f"• ⚖️ Gov enforcement: SEC/DOJ/FTC/CFPB/CFTC/EPA/FDA/state AGs\n"
         f"• Supreme Court: opinions + dockets + supremecourt.gov\n"
         f"• CAFC + CIT: patent rulings + trade court (PDF extraction)\n"
-        f"• 🇨🇳 China courts: SEC EDGAR 6-K + financial news monitoring\n"
+        f"• 🇨🇳 China courts: EDGAR 6-K + Shanghai Court + SPC + CJO\n"
+        f"• 🩺 Health monitor: rate limits, errors, 2h summaries\n"
         f"• Companies: **{public_count}** public + **{private_count}** private + **{len(CHINA_LITIGATION_WATCHLIST)}** China cases\n"
         f"• Hours: 9AM-4PM EST\n• CL Auth: {'✅' if COURTLISTENER_API_TOKEN else '⚠️ Not set'}\n"
         f"• AI: DeepSeek | Circuit breaker: enabled"),
@@ -2301,8 +2855,15 @@ def main():
         SEED_MODE = True
         log.info("🌱 Seed mode: first run with empty seen file — scanning all sources silently first")
 
-    # Total phases including Chinese court monitoring
-    TOTAL_PHASES = 14
+    # Phase names for health monitoring
+    PHASE_NAMES = {
+        0: "Federal Opinions", 1: "SCOTUS Opinions", 2: "Company Opinions",
+        3: "SCOTUS Docket", 4: "Federal Opinions", 5: "SCOTUS Website",
+        6: "CAFC Website", 7: "High-Impact", 8: "New Dockets",
+        9: "Buzzy Privates", 10: "State Courts", 11: "Gov Enforcement",
+        12: "EDGAR 6-K", 13: "Shanghai Court", 14: "SPC Court",
+        15: "China Justice Observer",
+    }
 
     while True:
         try:
@@ -2313,57 +2874,76 @@ def main():
                 time.sleep(30)
                 continue
 
-            # Staggered 14-phase cycle with adaptive intervals
-            # Phase 0: Federal opinions (broad)     Phase 1: SCOTUS opinions (CL API)
-            # Phase 2: Company opinions (CL API)    Phase 3: SCOTUS docket (CL API)
-            # Phase 4: Federal opinions (broad)     Phase 5: SCOTUS website scrape
-            # Phase 6: CAFC website scrape           Phase 7: High-impact filings
-            # Phase 8: New docket watch (lawsuits)  Phase 9: Buzzy private companies
-            # Phase 10: State court rulings (DE/CA/NY rotation)
-            # Phase 11: Gov enforcement (SEC/DOJ/FTC/CFPB/FDA/EPA/AG rotation)
+            # Staggered 16-phase cycle with adaptive intervals
+            # Phase 0,4: Federal opinions (broad)    Phase 1: SCOTUS opinions (CL API)
+            # Phase 2: Company opinions (CL API)     Phase 3: SCOTUS docket (CL API)
+            # Phase 5: SCOTUS website scrape          Phase 6: CAFC website scrape
+            # Phase 7: High-impact filings            Phase 8: New docket watch (lawsuits)
+            # Phase 9: Buzzy private companies        Phase 10: State court rulings (DE/CA/NY)
+            # Phase 11: Gov enforcement (agency rotation)
             # Phase 12: SEC EDGAR 6-K (Chinese court filings)
-            # Phase 13: China news monitor (Google News RSS)
+            # Phase 13: Shanghai High People's Court scraper
+            # Phase 14: Supreme People's Court monitor
+            # Phase 15: China Justice Observer monitor
             phase = cycle % TOTAL_PHASES
+            phase_name = PHASE_NAMES.get(phase, f"Phase {phase}")
+            n = 0
 
-            if phase in (0, 4):
-                n = check_federal_filings(seen)
-                if n and not SEED_MODE: log.info(f"Sent {n} federal opinion alerts")
-            elif phase == 1:
-                n = check_scotus_opinions(seen)
-                if n and not SEED_MODE: log.info(f"Sent {n} SCOTUS opinion alerts")
-            elif phase == 2:
-                n = check_federal_company(seen, cidx); cidx += 1
-                if n and not SEED_MODE: log.info(f"Sent {n} company opinion alerts")
-            elif phase == 3:
-                n = check_scotus_docket(seen)
-                if n and not SEED_MODE: log.info(f"Sent {n} SCOTUS docket alerts")
-            elif phase == 5:
-                n = check_scotus_website(seen)
-                if n and not SEED_MODE: log.info(f"Sent {n} SCOTUS.gov alerts")
-            elif phase == 6:
-                n = check_cafc_website(seen)
-                if n and not SEED_MODE: log.info(f"Sent {n} CAFC alerts")
-            elif phase == 7:
-                n = check_high_impact_filings(seen)
-                if n and not SEED_MODE: log.info(f"Sent {n} high-impact filing alerts")
-            elif phase == 8:
-                n = check_new_dockets(seen, didx); didx += 1
-                if n and not SEED_MODE: log.info(f"Sent {n} new docket alerts")
-            elif phase == 9:
-                n = check_buzzy_filings(seen, bidx); bidx += 1
-                if n and not SEED_MODE: log.info(f"Sent {n} buzzy company alerts")
-            elif phase == 10:
-                n = check_state_courts(seen, sidx); sidx += 1
-                if n and not SEED_MODE: log.info(f"Sent {n} state court ruling alerts")
-            elif phase == 11:
-                n = check_gov_enforcement(seen, gidx); gidx += 1
-                if n and not SEED_MODE: log.info(f"Sent {n} gov enforcement alerts")
-            elif phase == 12:
-                n = check_sec_edgar_6k(seen, eidx); eidx += 1
-                if n and not SEED_MODE: log.info(f"Sent {n} 🇨🇳 EDGAR 6-K alerts")
-            elif phase == 13:
-                n = check_china_news(seen, nidx); nidx += 1
-                if n and not SEED_MODE: log.info(f"Sent {n} 🇨🇳 China news alerts")
+            try:
+                if phase in (0, 4):
+                    n = check_federal_filings(seen)
+                    if n and not SEED_MODE: log.info(f"Sent {n} federal opinion alerts")
+                elif phase == 1:
+                    n = check_scotus_opinions(seen)
+                    if n and not SEED_MODE: log.info(f"Sent {n} SCOTUS opinion alerts")
+                elif phase == 2:
+                    n = check_federal_company(seen, cidx); cidx += 1
+                    if n and not SEED_MODE: log.info(f"Sent {n} company opinion alerts")
+                elif phase == 3:
+                    n = check_scotus_docket(seen)
+                    if n and not SEED_MODE: log.info(f"Sent {n} SCOTUS docket alerts")
+                elif phase == 5:
+                    n = check_scotus_website(seen)
+                    if n and not SEED_MODE: log.info(f"Sent {n} SCOTUS.gov alerts")
+                elif phase == 6:
+                    n = check_cafc_website(seen)
+                    if n and not SEED_MODE: log.info(f"Sent {n} CAFC alerts")
+                elif phase == 7:
+                    n = check_high_impact_filings(seen)
+                    if n and not SEED_MODE: log.info(f"Sent {n} high-impact filing alerts")
+                elif phase == 8:
+                    n = check_new_dockets(seen, didx); didx += 1
+                    if n and not SEED_MODE: log.info(f"Sent {n} new docket alerts")
+                elif phase == 9:
+                    n = check_buzzy_filings(seen, bidx); bidx += 1
+                    if n and not SEED_MODE: log.info(f"Sent {n} buzzy company alerts")
+                elif phase == 10:
+                    n = check_state_courts(seen, sidx); sidx += 1
+                    if n and not SEED_MODE: log.info(f"Sent {n} state court ruling alerts")
+                elif phase == 11:
+                    n = check_gov_enforcement(seen, gidx); gidx += 1
+                    if n and not SEED_MODE: log.info(f"Sent {n} gov enforcement alerts")
+                elif phase == 12:
+                    n = check_sec_edgar_6k(seen, eidx); eidx += 1
+                    if n and not SEED_MODE: log.info(f"Sent {n} 🇨🇳 EDGAR 6-K alerts")
+                elif phase == 13:
+                    n = check_shanghai_court(seen)
+                    if n and not SEED_MODE: log.info(f"Sent {n} 🇨🇳 Shanghai Court alerts")
+                elif phase == 14:
+                    n = check_spc_court(seen)
+                    if n and not SEED_MODE: log.info(f"Sent {n} 🇨🇳 SPC alerts")
+                elif phase == 15:
+                    n = check_china_justice_observer(seen)
+                    if n and not SEED_MODE: log.info(f"Sent {n} 🇨🇳 CJO alerts")
+
+                health_monitor.record_phase_success(phase_name)
+            except Exception as phase_err:
+                log.error(f"Phase {phase} ({phase_name}) error: {phase_err}")
+                health_monitor.record_phase_failure(phase_name, str(phase_err))
+
+            # Health monitor: check rate limits and send periodic summaries
+            health_monitor.check_rate_limit_warning()
+            health_monitor.maybe_send_summary()
 
             # After completing first full cycle, exit seed mode
             if SEED_MODE and cycle >= TOTAL_PHASES - 1:
